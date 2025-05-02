@@ -12,6 +12,7 @@ CODES_FILE = Path("jpx_codes.txt")
 DATA_DIR   = Path("feather"); DATA_DIR.mkdir(exist_ok=True)
 PERIOD, INTERVAL, CHUNK = "10y", "1d", 200
 LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
+TRAIN_SPLIT_YEARS = 1   # 最後の 1 年を検証用に使う
 
 def codes() -> list[str]:
     """
@@ -114,6 +115,10 @@ def update_chunk(chunk: list[str], idx: int):
     if f.exists():
         last = pd.read_feather(f, columns=["Date"]).Date.max()
         start = (pd.to_datetime(last) + pd.Timedelta(days=1)).date()
+        today = datetime.now().date()
+        if start > today:
+            # up to date; nothing new to fetch
+            return
 
     df = yf.download(
         " ".join(chunk),
@@ -194,7 +199,7 @@ def features(mat: pd.DataFrame) -> pd.DataFrame:
     # RSI
     feats["rsi_14"] = 100 - 100 / (1 + mat.pct_change().rolling(14).mean())
 
-    X = pd.concat(feats, axis=1).stack().dropna().reset_index()
+    X = pd.concat(feats, axis=1).stack(future_stack=True).dropna().reset_index()
     X["dayofweek"] = pd.to_datetime(X["Date"]).dt.dayofweek.astype("int8")
     X["month"]     = pd.to_datetime(X["Date"]).dt.month.astype("int8")
 
@@ -208,7 +213,7 @@ def features(mat: pd.DataFrame) -> pd.DataFrame:
     X = X[X["target"].abs() <= 1.0]
     return X.dropna()
 
-def train(df: pd.DataFrame):
+def train(df: pd.DataFrame, num_rounds: int):
     cat = ["Ticker"]
     for c in cat: df[c] = df[c].astype("category")
     dtrain = lgb.Dataset(df.drop(["Date","target"],axis=1), label=df.target,
@@ -216,7 +221,7 @@ def train(df: pd.DataFrame):
     params = dict(objective="regression", learning_rate=0.05,
                   num_leaves=63, metric="mae",
                   num_threads=cpu_count()-1, verbosity=-1)
-    return lgb.train(params, dtrain, num_boost_round=300)
+    return lgb.train(params, dtrain, num_boost_round=num_rounds)
 
 def predict(mat: pd.DataFrame, model: lgb.Booster) -> pd.DataFrame:
     last_feat = {}
@@ -237,7 +242,7 @@ def predict(mat: pd.DataFrame, model: lgb.Booster) -> pd.DataFrame:
 
     X = (
         pd.concat(last_feat, axis=1)
-        .stack()
+        .stack(future_stack=True)   # suppress FutureWarning
         .reset_index()
         .drop(["Date"], axis=1)
     )
@@ -280,13 +285,60 @@ def main():
         sys.exit("No tickers >= 100円")
 
     df = features(mat)
-    model = train(df)
-    # ---- モデル精度指標（学習データ上） ----
-    y_true = df["target"].values
-    y_pred = model.predict(df.drop(["Date", "target"], axis=1))
-    mse_val = mean_squared_error(y_true, y_pred)
-    r2_val  = r2_score(y_true, y_pred)
-    print(f"Training MSE: {mse_val:.6f}  |  R2: {r2_val:.4f}")
+
+    # ---- 時系列 hold‑out ----
+    split_date = mat.index.max() - pd.DateOffset(years=TRAIN_SPLIT_YEARS)
+    df_train = df[pd.to_datetime(df["Date"]) <= split_date].copy()
+    df_test  = df[pd.to_datetime(df["Date"]) >  split_date].copy()
+
+    # ---- LightGBM + walk‑forward CV ----
+    cat = ["Ticker"]
+    for c in cat:
+        df_train[c] = df_train[c].astype("category")
+
+    X_all = df_train.drop(["Date", "target"], axis=1)
+    y_all = df_train["target"]
+
+    from sklearn.model_selection import TimeSeriesSplit
+    tscv = TimeSeriesSplit(n_splits=4)
+    params = dict(objective="regression",
+                  learning_rate=0.05,
+                  num_leaves=63,
+                  metric="mae",
+                  num_threads=cpu_count() - 1,
+                  verbosity=-1)
+    best_iters = []
+    for tr_idx, vl_idx in tscv.split(X_all):
+        dtr = lgb.Dataset(X_all.iloc[tr_idx], label=y_all.iloc[tr_idx],
+                          categorical_feature=cat, free_raw_data=False)
+        dvl = lgb.Dataset(X_all.iloc[vl_idx], label=y_all.iloc[vl_idx],
+                          categorical_feature=cat, free_raw_data=False)
+        m = lgb.train(
+            params,
+            dtr,
+            num_boost_round=500,
+            valid_sets=[dvl],
+            callbacks=[lgb.early_stopping(stopping_rounds=50, verbose=False)]
+        )
+        best_iters.append(m.best_iteration)
+
+    num_boost = max(50, int(np.mean(best_iters)))
+    model = train(df_train, num_boost)
+    cat_levels = df_train["Ticker"].cat.categories
+
+    # ---- 指標 ----
+    def _metric(df_part, name):
+        df_part = df_part.copy()
+        for c in ["Ticker"]:
+            df_part[c] = pd.Categorical(df_part[c], categories=cat_levels)
+        y_true = df_part["target"].values
+        y_pred = model.predict(df_part.drop(["Date", "target"], axis=1))
+        mse  = mean_squared_error(y_true, y_pred)
+        r2   = r2_score(y_true, y_pred)
+        return f"{name}  MSE: {mse:.6f} | R2: {r2:.4f}"
+
+    print(_metric(df_train, "Train"), flush=True)
+    print(_metric(df_test,  "Test "), flush=True)
     top = predict(mat, model).head(20)
     top.to_csv(args.csv,index=False)
     print(top.to_string(index=False, formatters={
