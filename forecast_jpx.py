@@ -1,3 +1,24 @@
+import pandas as pd
+from scipy.optimize import minimize
+def walk_forward_splits(df: pd.DataFrame, date_col: str, n_splits: int):
+    """
+    Generate walk‑forward train/validation index splits based on a date column.
+    """
+    dates = pd.to_datetime(df[date_col]).sort_values().unique()
+    n = len(dates)
+    window = n // (n_splits + 1)
+    splits = []
+    for i in range(1, n_splits + 1):
+        train_end = dates[i * window]
+        valid_start = train_end + pd.Timedelta(days=1)
+        valid_end = dates[(i + 1) * window] if i < n_splits else dates[-1]
+        train_idx = df.index[pd.to_datetime(df[date_col]) <= train_end]
+        valid_idx = df.index[
+            (pd.to_datetime(df[date_col]) > train_end) &
+            (pd.to_datetime(df[date_col]) <= valid_end)
+        ]
+        splits.append((train_idx, valid_idx))
+    return splits
 #!/usr/bin/env python3
 import argparse, sys, time
 from pathlib import Path
@@ -9,8 +30,76 @@ import json
 import xgboost as xgb
 from catboost import CatBoostRegressor
 import optuna
+
+try:
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader, TensorDataset, random_split
+except ImportError:
+    torch = None
+
+def prepare_lstm_sequences(features_df: pd.DataFrame, window_size: int = 60, shift: int = 22):
+    sequences, targets, idxs = [], [], []
+    for ticker, df_t in features_df.groupby('Ticker'):
+        df_t = df_t.sort_values('Date')
+        indices = df_t.index.to_list()
+        X = df_t.drop(['Date', 'Ticker', 'target'], axis=1).values
+        y = df_t['target'].values
+        for i in range(window_size, len(X) - shift + 1):
+            seq = X[i - window_size:i]
+            label = y[i + shift - 1]
+            idx = indices[i + shift - 1]
+            sequences.append(seq)
+            targets.append(label)
+            idxs.append(idx)
+    return np.array(sequences), np.array(targets), np.array(idxs)
+
+class LSTMForecast(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.lstm1 = nn.LSTM(input_dim, 128, batch_first=True)
+        self.lstm2 = nn.LSTM(128, 64, batch_first=True)
+        self.fc1 = nn.Linear(64, 32)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(32, 1)
+
+    def forward(self, x):
+        x, _ = self.lstm1(x)
+        x, _ = self.lstm2(x)
+        x = x[:, -1, :]
+        x = self.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+# --------- TransformerForecast class ---------
+class TransformerForecast(nn.Module):
+    def __init__(self, input_dim, d_model=128, nhead=4, num_layers=2):
+        super().__init__()
+        self.input_proj = nn.Linear(input_dim, d_model)
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead)
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.fc = nn.Linear(d_model, 1)
+
+    def forward(self, x):
+        # x shape: (batch, seq_len, input_dim)
+        x = self.input_proj(x)            # (batch, seq_len, d_model)
+        x = x.permute(1, 0, 2)           # (seq_len, batch, d_model)
+        x = self.encoder(x)              # (seq_len, batch, d_model)
+        x = x[-1, :, :]                  # last time step (batch, d_model)
+        return self.fc(x)                # (batch, 1)
 from sklearn.metrics import mean_squared_error, r2_score
+
 from tqdm import tqdm
+
+# Suppress pandas future warnings and general user warnings
+import warnings, logging
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+# Reduce verbosity for Optuna, LightGBM, XGBoost, and CatBoost
+logging.getLogger("optuna").setLevel(logging.WARNING)
+logging.getLogger("lightgbm").setLevel(logging.ERROR)
+logging.getLogger("xgboost").setLevel(logging.ERROR)
+logging.getLogger("catboost").setLevel(logging.ERROR)
 
 FEAT_COLS: list[str] = []   # features order will be stored after first build
 
@@ -50,6 +139,9 @@ def load_sector_map(tickers: list[str]) -> dict[str, str]:
 SECTOR_FILE = Path("sectors.json")
 FUND_FILE   = Path("fundamentals.json")
 
+# --- 外生変数（為替・指数など） ---
+EXOGENOUS_TICKERS = ["JPY=X", "^N225", "^VIX", "^TOPX"]
+
 def load_fundamentals(tickers: list[str]) -> dict[str, dict]:
     """
     Return {ticker: {"PER": ..., "PBR": ..., "DivYield": ...}}.
@@ -66,15 +158,46 @@ def load_fundamentals(tickers: list[str]) -> dict[str, dict]:
         if t not in mp:
             try:
                 info = yf.Ticker(t).info
-                # capture all numeric fundamentals from yfinance info
+                # capture all numeric fundamentals and quoteType
                 num_info = {k: v for k, v in info.items() if isinstance(v, (int, float))}
+                num_info["quoteType"] = info.get("quoteType", "")
                 mp[t] = num_info
             except Exception:
-                mp[t] = {}
+                mp[t] = {"quoteType": ""}
             updated = True
     if updated:
         FUND_FILE.write_text(json.dumps(mp, ensure_ascii=False))
     return mp
+
+
+# --- 外生変数データの取得 ---
+def load_exogenous(tickers: list[str], start: str, end: str, interval: str) -> pd.DataFrame:
+    """
+    Fetch Close prices for exogenous tickers and return a DataFrame indexed by Date.
+    """
+    df = yf.download(
+        tickers,
+        start=start,
+        end=end,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        group_by="ticker",
+        threads=False,
+    )
+    # build a DataFrame of close prices
+    data = {}
+    if isinstance(df.columns, pd.MultiIndex):
+        for t in tickers:
+            sub = df[t]
+            col = "Close" if "Close" in sub else "Adj Close"
+            data[t] = sub[col]
+    else:
+        col = "Close" if "Close" in df else "Adj Close"
+        data[tickers[0]] = df[col]
+    exog = pd.DataFrame(data)
+    exog.index = pd.to_datetime(exog.index)
+    return exog.ffill()
 
 
 def codes() -> list[str]:
@@ -246,7 +369,7 @@ def price_matrix(cds: list[str]) -> pd.DataFrame:
     mat.index = pd.to_datetime(mat.index)
     return mat
 
-def features(mat: pd.DataFrame, funds: dict[str, dict]) -> pd.DataFrame:
+def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> pd.DataFrame:
     # 基本ラグ
     feats = {f"lag_{l}": mat.shift(l) for l in LAGS}
 
@@ -281,14 +404,42 @@ def features(mat: pd.DataFrame, funds: dict[str, dict]) -> pd.DataFrame:
     X["Sector"] = X["Ticker"].map(SECTOR_DICT).fillna("Unknown")
 
     # --- map static fundamentals ---
-    # map all numeric fundamentals dynamically
+    # map all numeric fundamentals dynamically (use all available yfinance indicators)
     if funds:
-        # get list of fundamental keys from the first ticker
-        fund_keys = list(next(iter(funds.values())).keys())
-        for key in fund_keys:
-            X[key] = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k))
-            # fill missing fundamentals with 0
-            X[key].fillna(0, inplace=True)
+        # collect the union of all numeric fundamental keys
+        all_keys = sorted({k for v in funds.values() for k in v.keys()})
+        for key in all_keys:
+            X[key] = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k, 0))
+
+    # 配当利回り
+    if 'dividendYield' in X.columns:
+        X['DividendYield'] = X['dividendYield'].fillna(0)
+    else:
+        X['DividendYield'] = 0
+
+    # ROE
+    if 'returnOnEquity' in X.columns:
+        X['ROE'] = X['returnOnEquity'].fillna(0)
+    else:
+        X['ROE'] = 0
+
+    # 自己資本比率 = (totalAssets - totalLiab) / totalAssets
+    if 'totalAssets' in X.columns and 'totalLiab' in X.columns:
+        X['EquityRatio'] = ((X['totalAssets'] - X['totalLiab']) / X['totalAssets']).fillna(0)
+    else:
+        X['EquityRatio'] = 0
+
+    # 営業益成長率
+    if 'earningsQuarterlyGrowth' in X.columns:
+        X['OpIncomeGrowth'] = X['earningsQuarterlyGrowth'].fillna(0)
+    else:
+        X['OpIncomeGrowth'] = 0
+
+    # --- 外生変数を特徴量に追加（高速マージ） ---
+    exog_df = exog.reset_index().rename(columns={'index': 'Date'})
+    X = X.merge(exog_df, on='Date', how='left')
+    X.fillna(method='ffill', inplace=True)
+    X.fillna(0, inplace=True)
 
     y = (
         (np.log(mat.shift(-SHIFT)) - np.log(mat))
@@ -321,7 +472,16 @@ def _prep_xy(df: pd.DataFrame, cat: list[str]):
     w = df["weight"].values if "weight" in df else None
     return X, X_num, X_cat, y, cat_idx, w
 
-def train_models(df: pd.DataFrame, num_rounds: int, cat: list[str], params_lgb: dict):
+def train_models(
+    df: pd.DataFrame,
+    num_rounds: int,
+    cat: list[str],
+    params_lgb: dict,
+    params_xgb: dict,
+    xgb_rounds: int,
+    params_cat: dict,
+    cat_rounds: int
+) -> tuple:
     """return (lgb_model, xgb_model, cat_model)"""
     X, X_num, X_cat, y, cat_idx, w = _prep_xy(df, cat)
 
@@ -331,23 +491,12 @@ def train_models(df: pd.DataFrame, num_rounds: int, cat: list[str], params_lgb: 
 
     # --- XGBoost ---
     dtrain_xgb = xgb.DMatrix(X_num, label=y, weight=w)
-    params_xgb = dict(
-        objective="reg:squarederror",
-        learning_rate=0.05,
-        max_depth=6,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        nthread=max(1, cpu_count()-1),
-        tree_method="hist"
-    )
-    mdl_xgb = xgb.train(params_xgb, dtrain_xgb, num_rounds)
+    mdl_xgb = xgb.train(params_xgb, dtrain_xgb, xgb_rounds)
 
     # --- CatBoost ---
     mdl_cat = CatBoostRegressor(
-        iterations=num_rounds,
-        learning_rate=0.05,
-        depth=6,
-        loss_function="MAE",
+        iterations=cat_rounds,
+        **params_cat,
         verbose=False,
         random_seed=42
     )
@@ -356,12 +505,14 @@ def train_models(df: pd.DataFrame, num_rounds: int, cat: list[str], params_lgb: 
     return mdl_lgb, mdl_xgb, mdl_cat
 
 # ---- Optuna で LightGBM ハイパラ探索 ----
+# ---- Optuna で LightGBM ハイパラ探索 ----
 def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
-    X = df_train.drop(["Date", "target"], axis=1)
-    y = df_train["target"].values
-    w = df_train["weight"].values
-    from sklearn.model_selection import TimeSeriesSplit
-    tscv = TimeSeriesSplit(n_splits=4)
+    # Prepare feature matrix and target/weight series for labelled indexing
+    X = df_train.drop(["Date", "target", "weight"], axis=1)
+    y_series = df_train["target"]
+    w_series = df_train["weight"]
+    # use walk-forward CV instead of TimeSeriesSplit
+    splits = walk_forward_splits(df_train, 'Date', n_splits=4)
 
     def objective(trial):
         params = dict(
@@ -379,20 +530,33 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
             verbosity=-1,
         )
         scores, iters = [], []
-        for tr_idx, vl_idx in tscv.split(X):
-            dtr = lgb.Dataset(X.iloc[tr_idx], label=y[tr_idx], weight=w[tr_idx],
+        for tr_idx, vl_idx in splits:
+            if len(tr_idx) == 0 or len(vl_idx) == 0:
+                continue
+            # Use .loc since tr_idx and vl_idx are label-based indexers
+            X_tr = X.loc[tr_idx]
+            y_tr = y_series.loc[tr_idx].values
+            w_tr = w_series.loc[tr_idx].values
+            dtr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
                               categorical_feature=cat, free_raw_data=False)
-            dvl = lgb.Dataset(X.iloc[vl_idx], label=y[vl_idx], weight=w[vl_idx],
+
+            X_vl = X.loc[vl_idx]
+            y_vl = y_series.loc[vl_idx].values
+            w_vl = w_series.loc[vl_idx].values
+            dvl = lgb.Dataset(X_vl, label=y_vl, weight=w_vl,
                               categorical_feature=cat, free_raw_data=False)
+
             m = lgb.train(params, dtr, 500,
                           valid_sets=[dvl],
                           valid_names=["valid"],
                           callbacks=[lgb.early_stopping(50, verbose=False)])
             # compute validation predictions at best iteration and evaluate R2
-            preds = m.predict(X.iloc[vl_idx], num_iteration=m.best_iteration)
-            r2 = r2_score(y[vl_idx], preds)
+            preds = m.predict(X_vl, num_iteration=m.best_iteration)
+            r2 = r2_score(y_vl, preds)
             scores.append(r2)
             iters.append(m.best_iteration)
+        if not scores:
+            raise ValueError("No valid CV splits")
         trial.set_user_attr("best_iters", int(np.mean(iters)))
         return float(np.mean(scores))
 
@@ -401,6 +565,119 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
     best_params = study.best_params
     best_params.update(objective="regression", metric=["r2"], num_threads=max(1, cpu_count()-1), verbosity=-1)
     best_iter  = study.best_trial.user_attrs["best_iters"]
+    return best_params, best_iter
+
+# ---- Optuna で XGBoost ハイパラ探索 ----
+def tune_xgb_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
+    X = df_train.drop(["Date", "target", "weight"], axis=1)
+    y_series = df_train["target"]
+    w_series = df_train["weight"]
+    splits = walk_forward_splits(df_train, 'Date', n_splits=4)
+
+    def objective(trial):
+        params = dict(
+            objective="reg:squarederror",
+            eval_metric="rmse",
+            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            max_depth=trial.suggest_int("max_depth", 3, 12),
+            subsample=trial.suggest_float("subsample", 0.6, 1.0),
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.6, 1.0),
+            reg_alpha=trial.suggest_float("reg_alpha", 0.0, 5.0),
+            reg_lambda=trial.suggest_float("reg_lambda", 0.0, 5.0),
+            nthread=max(1, cpu_count()-1),
+            tree_method="hist"
+        )
+        scores, iters = [], []
+        for tr_idx, vl_idx in splits:
+            if len(tr_idx) == 0 or len(vl_idx) == 0:
+                continue
+            X_tr = X.loc[tr_idx].copy()
+            for c in cat:
+                X_tr[c] = X_tr[c].cat.codes
+            y_tr = y_series.loc[tr_idx].values
+            w_tr = w_series.loc[tr_idx].values
+            dtr = xgb.DMatrix(X_tr, label=y_tr, weight=w_tr)
+
+            X_vl = X.loc[vl_idx].copy()
+            for c in cat:
+                X_vl[c] = X_vl[c].cat.codes
+            y_vl = y_series.loc[vl_idx].values
+            w_vl = w_series.loc[vl_idx].values
+            dvl = xgb.DMatrix(X_vl, label=y_vl, weight=w_vl)
+
+            m = xgb.train(params, dtr, 500,
+                          evals=[(dvl, "valid")],
+                          early_stopping_rounds=50,
+                          verbose_eval=False)
+            preds = m.predict(dvl, iteration_range=(0, m.best_iteration+1))
+            r2 = r2_score(y_vl, preds)
+            scores.append(r2)
+            iters.append(m.best_iteration)
+        if not scores:
+            raise ValueError("No valid CV splits")
+        trial.set_user_attr("best_iters", int(np.mean(iters)))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best_params = study.best_params
+    best_params.update(objective="reg:squarederror", eval_metric="rmse", nthread=max(1, cpu_count()-1), tree_method="hist")
+    best_iter = study.best_trial.user_attrs["best_iters"]
+    return best_params, best_iter
+
+# ---- Optuna で CatBoost ハイパラ探索 ----
+def tune_cat_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
+    X = df_train.drop(["Date", "target", "weight"], axis=1)
+    y_series = df_train["target"]
+    w_series = df_train["weight"]
+    splits = walk_forward_splits(df_train, 'Date', n_splits=4)
+
+    def objective(trial):
+        params = dict(
+            learning_rate=trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            depth=trial.suggest_int("depth", 4, 10),
+            l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1.0, 10.0),
+            loss_function="MAE",
+        )
+        scores, iters = [], []
+        for tr_idx, vl_idx in splits:
+            if len(tr_idx) == 0 or len(vl_idx) == 0:
+                continue
+            X_tr = X.loc[tr_idx].copy()
+            for c in cat:
+                X_tr[c] = X_tr[c].astype(str)
+            y_tr = y_series.loc[tr_idx].values
+            w_tr = w_series.loc[tr_idx].values
+
+            X_vl = X.loc[vl_idx].copy()
+            for c in cat:
+                X_vl[c] = X_vl[c].astype(str)
+            y_vl = y_series.loc[vl_idx].values
+            w_vl = w_series.loc[vl_idx].values
+
+            cat_idx = [X.columns.get_loc(c) for c in cat]
+            m = CatBoostRegressor(
+                iterations=500,
+                **params,
+                verbose=False,
+                random_seed=42
+            )
+            m.fit(X_tr, y_tr, sample_weight=w_tr, cat_features=cat_idx,
+                  eval_set=(X_vl, y_vl), early_stopping_rounds=50)
+            preds = m.predict(X_vl)
+            r2 = r2_score(y_vl, preds)
+            scores.append(r2)
+            iters.append(m.get_best_iteration())
+        if not scores:
+            raise ValueError("No valid CV splits")
+        trial.set_user_attr("best_iters", int(np.mean(iters)))
+        return float(np.mean(scores))
+
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
+    study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+    best_params = study.best_params
+    best_params.update(loss_function="MAE")
+    best_iter = study.best_trial.user_attrs["best_iters"]
     return best_params, best_iter
 
 def predict(mat: pd.DataFrame, models: tuple, weights: np.ndarray) -> pd.DataFrame:
@@ -453,7 +730,8 @@ def predict(mat: pd.DataFrame, models: tuple, weights: np.ndarray) -> pd.DataFra
     preds = weights[0]*p_lgb + weights[1]*p_xgb + weights[2]*p_cat
 
     current_prices = mat.iloc[-1]
-    curr = X["Ticker"].map(current_prices)
+    # map to numeric current prices
+    curr = X["Ticker"].map(current_prices).astype(float)
 
     # preds は log-return ⇒ 終値を復元
     pred_price = curr.values * np.exp(preds)
@@ -473,23 +751,32 @@ def main():
     args = p.parse_args()
 
     cds = codes()
+    # ETF/REIT を除外（quoteType "ETF" または "REIT" のもののみ除外）
+    FUNDAMENTALS = load_fundamentals(cds)
+    filtered_cds = []
+    for t in cds:
+        qt = FUNDAMENTALS.get(t, {}).get("quoteType", "") or ""
+        if qt.upper() not in ("ETF", "REIT"):
+            filtered_cds.append(t)
+    # 万が一全て除外された場合は元リストを使用
+    if not filtered_cds:
+        filtered_cds = cds.copy()
+    cds = filtered_cds
     global SECTOR_DICT
     SECTOR_DICT = load_sector_map(cds)
-
-    FUNDAMENTALS = load_fundamentals(cds)
 
     for i in tqdm(range(0, len(cds), CHUNK), desc="download"):
         update_chunk(cds[i:i + CHUNK], i // CHUNK)
 
     mat = price_matrix(cds)
 
-    # --- 現在値が 100 円未満の銘柄を除外 ---
-    current_prices = mat.iloc[-1]
-    mat = mat.loc[:, current_prices >= 100]
-    if mat.empty:
-        sys.exit("No tickers >= 100円")
 
-    df = features(mat, FUNDAMENTALS)
+    # --- 外生変数データの取得 ---
+    start_date = mat.index.min().strftime("%Y-%m-%d")
+    end_date   = mat.index.max().strftime("%Y-%m-%d")
+    EXOG_DF = load_exogenous(EXOGENOUS_TICKERS, start_date, end_date, INTERVAL)
+
+    df = features(mat, FUNDAMENTALS, EXOG_DF)
 
     # ---- サンプルウェイト (0.99 ** day_diff) ----
     max_dt = pd.to_datetime(df["Date"]).max()
@@ -514,56 +801,106 @@ def main():
         for df_ in (df_train, df_test):
             df_[c] = pd.Categorical(df_[c], categories=df_train[c].cat.categories)
 
-    # ---- Optuna で LightGBM ハイパラ探索 (30 trials) ----
-    best_params, best_iter = tune_lgbm_params(df_train, cat, n_trials=60)
-    num_boost = max(50, best_iter)
-    models = train_models(df_train, num_boost, cat, best_params)
-    # ---- Calculate ensemble weights by Test MSE inverse ----
-    def _model_preds(df_part):
-        Xp = df_part.drop(["Date", "target"], axis=1)
-        p_lgb = models[0].predict(Xp)
+    # ---- グローバルモデルのチューニング＆訓練 ----
+    best_params_g, best_iter_g = tune_lgbm_params(df_train, cat, n_trials=30)
+    # --- XGBoost hyperparameter tuning ---
+    best_params_xgb, best_rounds_xgb = tune_xgb_params(df_train, cat, n_trials=30)
+    # --- CatBoost hyperparameter tuning ---
+    best_params_cat, best_rounds_cat = tune_cat_params(df_train, cat, n_trials=30)
+    num_boost_g = max(50, best_iter_g)
+    global_models = train_models(
+        df_train,
+        num_boost_g,
+        cat,
+        best_params_g,
+        best_params_xgb,
+        best_rounds_xgb,
+        best_params_cat,
+        best_rounds_cat
+    )
+    # 仮：等重みアンサンブル（必要に応じて検証データで重み算出してください）
+    weights_global = np.array([1/3, 1/3, 1/3])
 
-        Xp_num = Xp.copy()
-        for c in cat:
-            Xp_num[c] = Xp_num[c].cat.codes
-        p_xgb = models[1].predict(xgb.DMatrix(Xp_num))
-
-        # prepare categorical input for CatBoost: fill NaNs and convert to string
-        Xp_cat = Xp.copy()
-        for c in cat:
-            # ensure "Unknown" category exists before filling
-            if "Unknown" not in Xp_cat[c].cat.categories:
-                Xp_cat[c] = Xp_cat[c].cat.add_categories("Unknown")
-            Xp_cat[c] = Xp_cat[c].fillna("Unknown").astype(str)
-        p_cat = models[2].predict(Xp_cat)
-        return np.vstack([p_lgb, p_xgb, p_cat])
-
-    preds_stack = _model_preds(df_test)
-    mses = ((preds_stack - df_test["target"].values)**2).mean(axis=1)
-    weights = 1 / mses
-    weights /= weights.sum()
-    cat_levels = {c: df_train[c].cat.categories for c in cat}
+    # ---- シーケンスモデル（Transformer）訓練 ----
+    # Prepare LSTM-like sequences for transformer
+    X_seq_all, y_seq_all, idxs = prepare_lstm_sequences(df, window_size=60, shift=SHIFT)
+    # Split sequences by train/test indices
+    train_mask = np.isin(idxs, df_train.index)
+    test_mask  = np.isin(idxs, df_test.index)
+    X_seq_train, y_seq_train = X_seq_all[train_mask], y_seq_all[train_mask]
+    X_seq_test,  y_seq_test  = X_seq_all[test_mask],  y_seq_all[test_mask]
+    # Build dataloaders
+    Xt_train = torch.tensor(X_seq_train, dtype=torch.float32)
+    yt_train = torch.tensor(y_seq_train, dtype=torch.float32).view(-1,1)
+    Xt_test  = torch.tensor(X_seq_test,  dtype=torch.float32)
+    yt_test  = torch.tensor(y_seq_test,  dtype=torch.float32).view(-1,1)
+    train_ds = TensorDataset(Xt_train, yt_train)
+    test_ds  = TensorDataset(Xt_test,  yt_test)
+    train_dl = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
+    test_dl  = DataLoader(test_ds, batch_size=128, num_workers=0)
+    # Instantiate and train
+    trans_model = TransformerForecast(input_dim=X_seq_train.shape[2])
+    optimizer_t = torch.optim.Adam(trans_model.parameters(), lr=1e-3)
+    criterion_t = nn.MSELoss()
+    for epoch in range(10):
+        trans_model.train()
+        for xb, yb in train_dl:
+            optimizer_t.zero_grad()
+            loss = criterion_t(trans_model(xb), yb)
+            loss.backward()
+            optimizer_t.step()
+    # Evaluate on test sequences
+    trans_model.eval()
+    p_trans = []
+    with torch.no_grad():
+        for xb, _ in test_dl:
+            p_trans.append(trans_model(xb).numpy().flatten())
+    p_trans = np.concatenate(p_trans)
 
     # ---- 指標 ----
     def _metric(df_part, name):
-        df_part = df_part.copy()
-        for c in cat:
-            df_part[c] = pd.Categorical(df_part[c], categories=cat_levels[c])
-        y_true = df_part["target"].values
-        y_pred = models[0].predict(df_part.drop(["Date", "target"], axis=1))
-        mse  = mean_squared_error(y_true, y_pred)
-        r2   = r2_score(y_true, y_pred)
+        # prepare features
+        X, X_num, X_cat, y_true, _, _ = _prep_xy(df_part, cat)
+        # get ensemble predictions
+        p_lgb = global_models[0].predict(X)
+        p_xgb = global_models[1].predict(xgb.DMatrix(X_num))
+        p_cat = global_models[2].predict(X_cat)
+        preds = weights_global[0]*p_lgb + weights_global[1]*p_xgb + weights_global[2]*p_cat
+        mse = mean_squared_error(y_true, preds)
+        r2  = r2_score(y_true, preds)
         return f"{name}  MSE: {mse:.6f} | R2: {r2:.4f}"
 
-    print(_metric(df_train, "Train"), flush=True)
-    print(_metric(df_test,  "Test "), flush=True)
-    top = predict(mat, models, weights).head(20)
-    top.to_csv(args.csv,index=False)
-    print(top.to_string(index=False, formatters={
+
+    # ---- グローバルモデルによる予測 ----
+    # (Pre-optimization output removed)
+
+    # --- ensemble weight optimization on validation set ---
+    X_test, X_num_test, X_cat_test, y_test, _, _ = _prep_xy(df_test, cat)
+    p_lgb = global_models[0].predict(X_test)
+    p_xgb = global_models[1].predict(xgb.DMatrix(X_num_test))
+    p_cat = global_models[2].predict(X_cat_test)
+    preds_list = [p_lgb, p_xgb, p_cat, p_trans]
+    # initial equal weights for four models
+    weights_global = np.array([0.25, 0.25, 0.25, 0.25])
+    def loss_fn(w):
+        blended = sum(wi * pi for wi, pi in zip(w, preds_list))
+        return -r2_score(y_test, blended)
+    cons = ({'type':'eq','fun': lambda w: sum(w)-1})
+    bounds = [(0,1)]*4
+    res = minimize(loss_fn, weights_global, bounds=bounds, constraints=cons)
+    weights_global = res.x
+
+    # ---- Output after optimization ----
+    preds_df_opt = predict(mat, global_models, weights_global[:3]).head(20)
+    preds_df_opt.to_csv(args.csv, index=False)
+    print(preds_df_opt.to_string(index=False, formatters={
         "Current": "{:.2f}".format,
         "Predicted": "{:.2f}".format,
         "Ratio": "{:.2%}".format,
     }))
+    blended = sum(w * p for w, p in zip(weights_global, preds_list))
+    print(f"Optimized weights: {weights_global}")
+    print(f"Test  (opt) MSE: {mean_squared_error(y_test, blended):.6f} | R2: {r2_score(y_test, blended):.4f}")
 
 if __name__=="__main__":
     main()

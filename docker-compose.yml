@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  forecast:
+    build: .
+    container_name: stockpy-forecast
+    volumes:
+      - .:/app
+    working_dir: /app
+    command: ["--csv", "result.csv"]
