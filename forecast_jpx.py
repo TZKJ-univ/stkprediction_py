@@ -93,6 +93,7 @@ from tqdm import tqdm
 
 # Suppress pandas future warnings and general user warnings
 import warnings, logging
+import gc
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 # Reduce verbosity for Optuna, LightGBM, XGBoost, and CatBoost
@@ -818,6 +819,9 @@ def main():
         best_params_cat,
         best_rounds_cat
     )
+    # 訓練用データやOptunaオブジェクトを解放してメモリをクリア
+    del df_train, df_test
+    gc.collect()
     # 仮：等重みアンサンブル（必要に応じて検証データで重み算出してください）
     weights_global = np.array([1/3, 1/3, 1/3])
 
@@ -836,8 +840,20 @@ def main():
     yt_test  = torch.tensor(y_seq_test,  dtype=torch.float32).view(-1,1)
     train_ds = TensorDataset(Xt_train, yt_train)
     test_ds  = TensorDataset(Xt_test,  yt_test)
-    train_dl = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0)
-    test_dl  = DataLoader(test_ds, batch_size=128, num_workers=0)
+    train_dl = DataLoader(
+        train_ds,
+        batch_size=128,
+        shuffle=True,
+        num_workers=0,
+        pin_memory=True,
+        drop_last=True,
+    )
+    test_dl = DataLoader(
+        test_ds,
+        batch_size=128,
+        num_workers=0,
+        pin_memory=True,
+    )
     # Instantiate and train
     trans_model = TransformerForecast(input_dim=X_seq_train.shape[2])
     optimizer_t = torch.optim.Adam(trans_model.parameters(), lr=1e-3)
@@ -856,6 +872,9 @@ def main():
         for xb, _ in test_dl:
             p_trans.append(trans_model(xb).numpy().flatten())
     p_trans = np.concatenate(p_trans)
+    # シーケンス学習用データを解放してメモリをクリア
+    del X_seq_all, y_seq_all, idxs, Xt_train, yt_train, Xt_test, yt_test, train_ds, test_ds, train_dl, test_dl
+    gc.collect()
 
     # ---- 指標 ----
     def _metric(df_part, name):
