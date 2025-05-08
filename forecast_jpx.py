@@ -608,6 +608,8 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
 
 # ---- Optuna で XGBoost ハイパラ探索 ----
 def tune_xgb_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
+    # Remove unsupported object dtype columns
+    df_train = df_train.drop(columns=['quoteType'], errors='ignore')
     X = df_train.drop(["Date", "target", "weight"], axis=1)
     y_series = df_train["target"]
     w_series = df_train["weight"]
@@ -666,6 +668,8 @@ def tune_xgb_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
 
 # ---- Optuna で CatBoost ハイパラ探索 ----
 def tune_cat_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
+    # Remove unsupported object dtype columns
+    df_train = df_train.drop(columns=['quoteType'], errors='ignore')
     X = df_train.drop(["Date", "target", "weight"], axis=1)
     y_series = df_train["target"]
     w_series = df_train["weight"]
