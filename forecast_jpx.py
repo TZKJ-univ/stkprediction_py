@@ -492,7 +492,8 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
 def _prep_xy(df: pd.DataFrame, cat: list[str]):
     """return X(num) for xgb, X(cat) for catboost, y, cat_idx, w"""
     global FEAT_COLS
-    X = df.drop(["Date", "target"], axis=1)
+    # Drop non-feature columns including quoteType if present
+    X = df.drop(["Date", "target", "quoteType"], axis=1, errors="ignore")
     if not FEAT_COLS:
         FEAT_COLS = X.columns.tolist()
     X = X[FEAT_COLS]          # 固定順
