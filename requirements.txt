@@ -2,10 +2,10 @@ pandas
 numpy
 scikit-learn
 scipy
-yfinance
+git+https://github.com/ranaroussi/yfinance.git@main#egg=yfinance
 lightgbm
 xgboost
 catboost
 optuna
 torch
-tqdm
+pyarrow

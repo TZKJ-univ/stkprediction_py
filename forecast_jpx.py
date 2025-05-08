@@ -104,7 +104,7 @@ logging.getLogger("catboost").setLevel(logging.ERROR)
 
 FEAT_COLS: list[str] = []   # features order will be stored after first build
 
-CODES_FILE = Path("jpx_codes.txt")
+CODES_FILE = Path("jpx_codes_full.txt")
 DATA_DIR   = Path("feather"); DATA_DIR.mkdir(exist_ok=True)
 PERIOD, INTERVAL, CHUNK = "10y", "1d", 200
 LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
@@ -296,6 +296,9 @@ def update_ticker_csv(ticker: str, max_retry: int = 5):
         price.to_csv(fcsv, index=False)
 
 def update_chunk(chunk: list[str], idx: int):
+    # Prepare list of tickers to fetch and accumulator
+    to_fetch = chunk.copy()
+    acc_df = None
     f = DATA_DIR / f"{idx}.feather"
 
     start = "2015-01-01"
@@ -307,17 +310,48 @@ def update_chunk(chunk: list[str], idx: int):
             # up to date; nothing new to fetch
             return
 
-    df = yf.download(
-        " ".join(chunk),
-        start=start,
-        interval=INTERVAL,
-        auto_adjust=False,
-        progress=False,
-        group_by="ticker",
-        threads=False,
-    )
-    if df.empty:
+    max_retry = 5
+    for r in range(max_retry):
+        try:
+            # Download only the tickers still missing
+            df_chunk = yf.download(
+                tickers=to_fetch,
+                start=start,
+                interval=INTERVAL,
+                auto_adjust=False,
+                progress=False,
+                group_by="ticker",
+                threads=False,
+            )
+            # Treat empty DataFrame as failure
+            if df_chunk.empty:
+                raise ValueError("Empty data for chunk")
+            # Accumulate fetched data
+            if acc_df is None:
+                acc_df = df_chunk
+            else:
+                acc_df = pd.concat([acc_df, df_chunk], axis=1)
+            # Determine which tickers were successfully fetched
+            if isinstance(df_chunk.columns, pd.MultiIndex):
+                available = df_chunk.columns.get_level_values(0).unique().tolist()
+            else:
+                available = to_fetch.copy()
+            missing = list(set(to_fetch) - set(available))
+            # If some tickers are still missing, retry those
+            if missing and r < max_retry - 1:
+                to_fetch = missing
+                time.sleep(2 ** r)
+                continue
+            # All requested tickers fetched (or no more retries)
+            break
+        except Exception:
+            # Exponential backoff on any error
+            time.sleep(2 ** r)
+    else:
+        # All retries failed
         return
+    # Use accumulated DataFrame for downstream processing
+    df = acc_df
 
     # ----- Close が無いときは Adj Close を使う -----
     if isinstance(df.columns, pd.MultiIndex):
@@ -508,6 +542,8 @@ def train_models(
 # ---- Optuna で LightGBM ハイパラ探索 ----
 # ---- Optuna で LightGBM ハイパラ探索 ----
 def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
+    # Remove unsupported object dtype column to avoid LightGBM error
+    df_train = df_train.drop(columns=['quoteType'], errors='ignore')
     # Prepare feature matrix and target/weight series for labelled indexing
     X = df_train.drop(["Date", "target", "weight"], axis=1)
     y_series = df_train["target"]
