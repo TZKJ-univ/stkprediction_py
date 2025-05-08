@@ -395,6 +395,8 @@ def price_matrix(cds: list[str]) -> pd.DataFrame:
     if not files:
         sys.exit("no feather data")
     df = pd.concat(pd.read_feather(f) for f in files)
+    # Remove any duplicate Date/Ticker rows before pivot
+    df = df.drop_duplicates(subset=["Date", "Ticker"])
     mat = (
         df.pivot(index="Date", columns="Ticker", values="Close")
           .sort_index()
