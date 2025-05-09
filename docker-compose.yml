@@ -5,6 +5,10 @@ services:
     build: .
     container_name: stockpy-forecast
     runtime: nvidia
+    device_requests:
+      - driver: "nvidia"
+        count: -1
+        capabilities: ["gpu"]
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
     volumes:
