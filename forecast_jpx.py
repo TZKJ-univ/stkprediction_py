@@ -876,8 +876,6 @@ def main():
         best_rounds_cat
     )
     # 訓練用データやOptunaオブジェクトを解放してメモリをクリア
-    del df_train, df_test
-    gc.collect()
     # 仮：等重みアンサンブル（必要に応じて検証データで重み算出してください）
     weights_global = np.array([1/3, 1/3, 1/3])
 
