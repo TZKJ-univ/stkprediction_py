@@ -112,7 +112,7 @@ LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
 TRAIN_SPLIT_YEARS = 0.5   # 最後の0.5年（6ヶ月）を検証用に使う
 
 # 記憶保持年数（コード内に固定）
-HISTORY_YEARS = 5
+HISTORY_YEARS = 10
 
 SECTOR_FILE = Path("sectors.json")
 SECTOR_DICT: dict[str, str] = {}      # filled in main()
