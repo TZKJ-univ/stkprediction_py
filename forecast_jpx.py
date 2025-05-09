@@ -24,6 +24,7 @@ import argparse, sys, time
 from pathlib import Path
 from datetime import datetime
 from multiprocessing import cpu_count
+import os
 
 import pandas as pd, numpy as np, yfinance as yf, lightgbm as lgb, json
 import json
@@ -109,6 +110,9 @@ DATA_DIR   = Path("feather"); DATA_DIR.mkdir(exist_ok=True)
 PERIOD, INTERVAL, CHUNK = "10y", "1d", 200
 LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
 TRAIN_SPLIT_YEARS = 0.5   # 最後の0.5年（6ヶ月）を検証用に使う
+
+# 記憶保持年数（コード内に固定）
+HISTORY_YEARS = 5
 
 SECTOR_FILE = Path("sectors.json")
 SECTOR_DICT: dict[str, str] = {}      # filled in main()
@@ -443,10 +447,12 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
     # --- map static fundamentals ---
     # map all numeric fundamentals dynamically (use all available yfinance indicators)
     if funds:
-        # collect the union of all numeric fundamental keys
-        all_keys = sorted({k for v in funds.values() for k in v.keys()})
+        # collect the union of all numeric fundamental keys except "quoteType"
+        all_keys = sorted({k for v in funds.values() for k in v.keys() if k != "quoteType"})
         for key in all_keys:
             X[key] = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k, 0))
+        # Drop quoteType column if present
+        X = X.drop(columns=["quoteType"], errors="ignore")
 
     # 配当利回り
     if 'dividendYield' in X.columns:
@@ -486,6 +492,9 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
     X["target"] = y.values
     # ±100% (= 約 ±0.693 in log) 以上の外れ値を除外
     X = X[X["target"].abs() <= 1.0]
+    # downcast float64 to float32 to reduce memory footprint
+    for col in X.select_dtypes(include=['float64']).columns:
+        X[col] = X[col].astype('float32')
     # keep rows even if fundamentals have missing (filled with 0), only drop if target missing
     return X[X["target"].notna()]
 
@@ -524,7 +533,7 @@ def train_models(
     X, X_num, X_cat, y, cat_idx, w = _prep_xy(df, cat)
 
     # --- LightGBM ---
-    dtrain_lgb = lgb.Dataset(X, label=y, weight=w, categorical_feature=cat, free_raw_data=False)
+    dtrain_lgb = lgb.Dataset(X, label=y, weight=w, categorical_feature=cat, free_raw_data=True)
     mdl_lgb = lgb.train(params_lgb, dtrain_lgb, num_boost_round=num_rounds)
 
     # --- XGBoost ---
@@ -566,7 +575,7 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
             reg_alpha=trial.suggest_float("reg_alpha", 0.0, 5.0),
             reg_lambda=trial.suggest_float("reg_lambda", 0.0, 5.0),
             min_child_samples = trial.suggest_int("min_child_samples", 10, 50),
-            num_threads=max(1, cpu_count()-1),
+            num_threads=1,
             verbosity=-1,
         )
         scores, iters = [], []
@@ -578,13 +587,13 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
             y_tr = y_series.loc[tr_idx].values
             w_tr = w_series.loc[tr_idx].values
             dtr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
-                              categorical_feature=cat, free_raw_data=False)
+                              categorical_feature=cat, free_raw_data=True)
 
             X_vl = X.loc[vl_idx]
             y_vl = y_series.loc[vl_idx].values
             w_vl = w_series.loc[vl_idx].values
             dvl = lgb.Dataset(X_vl, label=y_vl, weight=w_vl,
-                              categorical_feature=cat, free_raw_data=False)
+                              categorical_feature=cat, free_raw_data=True)
 
             m = lgb.train(params, dtr, 500,
                           valid_sets=[dvl],
@@ -603,7 +612,7 @@ def tune_lgbm_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60)
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best_params = study.best_params
-    best_params.update(objective="regression", metric=["r2"], num_threads=max(1, cpu_count()-1), verbosity=-1)
+    best_params.update(objective="regression", metric=["r2"], num_threads=1, verbosity=-1)
     best_iter  = study.best_trial.user_attrs["best_iters"]
     return best_params, best_iter
 
@@ -626,7 +635,7 @@ def tune_xgb_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
             colsample_bytree=trial.suggest_float("colsample_bytree", 0.6, 1.0),
             reg_alpha=trial.suggest_float("reg_alpha", 0.0, 5.0),
             reg_lambda=trial.suggest_float("reg_lambda", 0.0, 5.0),
-            nthread=max(1, cpu_count()-1),
+            nthread=1,
             tree_method="hist"
         )
         scores, iters = [], []
@@ -663,7 +672,7 @@ def tune_xgb_params(df_train: pd.DataFrame, cat: list[str], n_trials: int = 60):
     study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=42))
     study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
     best_params = study.best_params
-    best_params.update(objective="reg:squarederror", eval_metric="rmse", nthread=max(1, cpu_count()-1), tree_method="hist")
+    best_params.update(objective="reg:squarederror", eval_metric="rmse", nthread=1, tree_method="hist")
     best_iter = study.best_trial.user_attrs["best_iters"]
     return best_params, best_iter
 
@@ -813,6 +822,10 @@ def main():
         update_chunk(cds[i:i + CHUNK], i // CHUNK)
 
     mat = price_matrix(cds)
+    # メモリ節約: 過去5年分の履歴に限定
+    cutoff = mat.index.max() - pd.DateOffset(years=HISTORY_YEARS)
+    mat = mat[mat.index >= cutoff]
+    gc.collect()
 
 
     # --- 外生変数データの取得 ---
