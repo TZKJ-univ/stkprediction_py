@@ -39,6 +39,9 @@ try:
 except ImportError:
     torch = None
 
+# GPU or CPU device for PyTorch
+device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
+
 def prepare_lstm_sequences(features_df: pd.DataFrame, window_size: int = 60, shift: int = 22):
     sequences, targets, idxs = [], [], []
     for ticker, df_t in features_df.groupby('Ticker'):
@@ -909,12 +912,14 @@ def main():
         pin_memory=True,
     )
     # Instantiate and train
-    trans_model = TransformerForecast(input_dim=X_seq_train.shape[2])
+    trans_model = TransformerForecast(input_dim=X_seq_train.shape[2]).to(device)
     optimizer_t = torch.optim.Adam(trans_model.parameters(), lr=1e-3)
     criterion_t = nn.MSELoss()
     for epoch in range(10):
         trans_model.train()
         for xb, yb in train_dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
             optimizer_t.zero_grad()
             loss = criterion_t(trans_model(xb), yb)
             loss.backward()
@@ -924,7 +929,9 @@ def main():
     p_trans = []
     with torch.no_grad():
         for xb, _ in test_dl:
-            p_trans.append(trans_model(xb).numpy().flatten())
+            xb = xb.to(device)
+            preds_batch = trans_model(xb)
+            p_trans.append(preds_batch.cpu().numpy().flatten())
     p_trans = np.concatenate(p_trans)
     # シーケンス学習用データを解放してメモリをクリア
     del X_seq_all, y_seq_all, idxs, Xt_train, yt_train, Xt_test, yt_test, train_ds, test_ds, train_dl, test_dl

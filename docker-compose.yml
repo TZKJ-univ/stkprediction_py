@@ -4,6 +4,9 @@ services:
   forecast:
     build: .
     container_name: stockpy-forecast
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
     volumes:
       - .:/app
     working_dir: /app
