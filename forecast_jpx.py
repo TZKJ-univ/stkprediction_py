@@ -115,7 +115,7 @@ LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
 TRAIN_SPLIT_YEARS = 0.5   # 最後の0.5年（6ヶ月）を検証用に使う
 
 # 記憶保持年数（コード内に固定）
-HISTORY_YEARS = 10
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "5"))
 
 SECTOR_FILE = Path("sectors.json")
 SECTOR_DICT: dict[str, str] = {}      # filled in main()
@@ -878,6 +878,9 @@ def main():
         best_params_cat,
         best_rounds_cat
     )
+    # メモリ解放: 訓練用データを削除してガベージコレクション
+    del df_train, df_test
+    import gc; gc.collect()
     # 訓練用データやOptunaオブジェクトを解放してメモリをクリア
     # 仮：等重みアンサンブル（必要に応じて検証データで重み算出してください）
     weights_global = np.array([1/3, 1/3, 1/3])
