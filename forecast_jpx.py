@@ -509,7 +509,7 @@ class StockPriceTFT(nn.Module):
         self.transformer = TransformerEncoder(enc_layer, num_layers=1)
         self.fc = nn.Linear(d_model, 1)
 
-    def forward(self, x_seq: torch.Tensor, ticker_id: torch.Tensor):
+    def forward(self, x_seq: torch.Tensor, ticker_id: torch.Tensor): # type: ignore
         # x_seq shape: (batch, seq_len, input_dim)
         # ticker_id shape: (batch,)
         h0 = self.embed(ticker_id).unsqueeze(0)          # (1, batch, d_model)
