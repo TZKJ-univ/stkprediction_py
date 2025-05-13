@@ -37,8 +37,18 @@ try:
 except ImportError:
     torch = None
 
-# GPU or CPU device for PyTorch
-device = torch.device("cuda" if torch and torch.cuda.is_available() else "cpu")
+# ---- device selection ----
+if torch is None:
+    device = "cpu"
+else:
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        # Apple Silicon GPU (Metal Performance Shaders)
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+print(f"[INFO] Using device: {device}")
 
 def prepare_lstm_sequences(features_df: pd.DataFrame, window_size: int = 60, shift: int = 22):
     sequences, targets, idxs = [], [], []
@@ -580,6 +590,20 @@ def main():
             loss = criterion(model(xb, tidb), yb)
             loss.backward()
             optimizer.step()
+        # --- Epoch-end evaluation: preview top-10 ratios ---
+        model.eval()
+        epoch_rows = []
+        with torch.no_grad():
+            for tid, tkr in enumerate(mat.columns):
+                seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
+                pred_price = model(seq, torch.tensor([tid], device=device)).item()
+                cur_price  = mat[tkr].values[-1]
+                ratio = pred_price / cur_price
+                if ratio > 1.0:
+                    epoch_rows.append((tkr, ratio))
+        top10 = sorted(epoch_rows, key=lambda x: x[1], reverse=True)[:10]
+        top10_str = "; ".join(f"{t}:{r:.2%}" for t, r in top10)
+        print(f"[Epoch {epoch+1}/10] Top-10 ratio preview → {top10_str}")
 
     # ---- 推論＆結果整形 ----
     model.eval()
