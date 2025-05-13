@@ -577,6 +577,8 @@ def main():
     X_all, y_all, tids_all = build_dataset(mat, window_size=60, shift=SHIFT)
     full_ds = TensorDataset(X_all, tids_all, y_all)
     full_dl = DataLoader(full_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
+    eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
+    y_mean  = y_all.mean().item()
 
     model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -603,7 +605,22 @@ def main():
                     epoch_rows.append((tkr, ratio))
         top10 = sorted(epoch_rows, key=lambda x: x[1], reverse=True)[:10]
         top10_str = "; ".join(f"{t}:{r:.2%}" for t, r in top10)
-        print(f"[Epoch {epoch+1}/10] Top-10 ratio preview → {top10_str}")
+
+        # ---- MSE & R2 over all samples ----
+        mse_sum = ss_res = ss_tot = n_total = 0.0
+        with torch.no_grad():
+            for xb, tidb, yb in eval_dl:
+                xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+                pred = model(xb, tidb)
+                diff = pred - yb
+                mse_sum += diff.pow(2).sum().item()
+                ss_res  += diff.pow(2).sum().item()
+                ss_tot  += (yb - y_mean).pow(2).sum().item()
+                n_total += yb.numel()
+        mse = mse_sum / n_total if n_total else float("nan")
+        r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
+
+        print(f"[Epoch {epoch+1}/10] MSE={mse:.6f} | R2={r2:.4f} | Top‑10 → {top10_str}")
 
     # ---- 推論＆結果整形 ----
     model.eval()
