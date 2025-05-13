@@ -1,11 +1,11 @@
-pandas
-numpy
-scikit-learn
-scipy
+pandas==2.2.2
+numpy==1.26.4
 git+https://github.com/ranaroussi/yfinance.git@main#egg=yfinance
-lightgbm
-xgboost
-catboost
-optuna
-torch
-pyarrow
+tqdm==4.66.4
+pyarrow==16.1.0
+
+# GPU‑enabled PyTorch (CUDA 12.1)
+torch==2.3.0+cu121
+torchvision==0.18.0+cu121
+torchaudio==2.3.0+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
