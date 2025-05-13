@@ -1,17 +1,25 @@
-version: '3.8'
-
 services:
   forecast:
-    build: .
-    container_name: stockpy-forecast
-    runtime: nvidia
-    device_requests:
-      - driver: "nvidia"
-        count: -1
-        capabilities: ["gpu"]
-    environment:
-      - NVIDIA_VISIBLE_DEVICES=all
+    # ビルド時にこの名前のイメージを作成する
+    image: stockpy-forecast:latest
+
+    # Dockerfile があるディレクトリをコンテキストに指定
+    build:
+      context: .
+      dockerfile: Dockerfile
+
+    # すべての GPU を割り当てる
+    gpus: all
+
+    # ホスト側カレントを /app にマウント
     volumes:
       - .:/app
+
     working_dir: /app
+
+    # 起動コマンドは entrypoint＋command の組み合わせで明示
+    entrypoint: ["python", "forecast_jpx.py"]
     command: ["--csv", "result.csv"]
+
+    # 任意：ログを見やすく
+    restart: on-failure

@@ -1,28 +1,29 @@
-# ベースイメージに公式の Python スリム版を使用
-FROM nvidia/cuda:12.8.0-base-ubuntu24.04
+# CUDA 12.6.3 + Ubuntu24.04 をベースにする
+FROM nvidia/cuda:12.6.3-base-ubuntu24.04
 
 # 環境変数
 ENV PYTHONUNBUFFERED=1
 ENV TZ=Asia/Tokyo
+ENV PATH="/opt/venv/bin:$PATH"
 
-# システム依存ライブラリのインストール
+# システム依存ライブラリと venv 用ツールのインストール
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      python3.12 python3-pip python3-setuptools \
-      build-essential \
-      git && \
-    ln -s /usr/bin/python3.12 /usr/local/bin/python && \
-    rm -rf /var/lib/apt/lists/*
+      python3.12 python3.12-venv build-essential git && \
+    rm -rf /var/lib/apt/lists/* && \
+    python3.12 -m venv /opt/venv
 
-# 作業ディレクトリを /app に設定
 WORKDIR /app
 
-# 依存関係をコピーしてインストール
+# 依存を先にコピーしてキャッシュを有効活用
 COPY requirements.txt ./
+
+# 仮想環境内でインストール
 RUN pip install --no-cache-dir -r requirements.txt
 
-# アプリケーションコードを全てコピー
+# ソースコードを全コピー
 COPY . .
 
-# デフォルトの実行コマンド
+# 実行コマンド
 ENTRYPOINT ["python", "forecast_jpx.py"]
+CMD ["--csv", "result.csv"]
