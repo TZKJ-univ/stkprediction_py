@@ -601,9 +601,11 @@ def main():
                 pred_price = model(seq, torch.tensor([tid], device=device)).item()
                 cur_price  = mat[tkr].values[-1]
                 ratio = pred_price / cur_price
-                if ratio > 1.0:
-                    epoch_rows.append((tkr, ratio))
+                epoch_rows.append((tkr, ratio))  # collect all; we'll sort later
         top10 = sorted(epoch_rows, key=lambda x: x[1], reverse=True)[:10]
+        if not top10:
+            print(f"[Epoch {epoch+1}/10] MSE={mse:.6f} | R2={r2:.4f} | Top‑10 → (no predictions yet)")
+            continue
         top10_str = "; ".join(f"{t}:{r:.2%}" for t, r in top10)
 
         # ---- MSE & R2 over all samples ----
