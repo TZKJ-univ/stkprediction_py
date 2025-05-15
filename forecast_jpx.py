@@ -555,6 +555,9 @@ def build_dataset(mat: pd.DataFrame, window_size: int = 60, shift: int = 22):
             if label_ratio <= 0:
                 continue
             label = np.log(label_ratio)
+            # skip targets outside ±0.5 to remove extreme outliers
+            if abs(label) > 0.5:
+                continue
             Xs.append(window)
             ys.append(label)
             tids.append(tid)
@@ -602,10 +605,16 @@ def main():
     # ---- Transformer‑based global model ----
     # Build supervised tensors for all tickers
     X_all, y_all, tids_all = build_dataset(mat, window_size=60, shift=SHIFT)
+    # --- 標準化: 入力特徴量(X_all)とターゲット(y_all)を平均0分散1にスケーリング ---
+    X_mean = X_all.mean()
+    X_std = X_all.std()
+    y_all_mean = y_all.mean().item()
+    y_all_std = y_all.std().item()
+    X_all = (X_all - X_mean) / X_std
+    y_all = (y_all - y_all_mean) / y_all_std
     full_ds = TensorDataset(X_all, tids_all, y_all)
     full_dl = DataLoader(full_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
     eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
-    y_mean  = y_all.mean().item()
 
     model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -704,12 +713,15 @@ def main():
             if np.any(ratio <= 0):
                 continue
             window = np.log(ratio)
-            seq = torch.tensor(window, dtype=torch.float32, device=device) \
+            # apply same normalization as training
+            seq = torch.tensor((window - X_mean.item()) / X_std.item(), dtype=torch.float32, device=device) \
                        .unsqueeze(0).unsqueeze(-1)
 
-            # モデル出力（対数リターン）を取得しクリップ
-            pred_log_return = model(seq, torch.tensor([tid], device=device)).item()
-            pred_log_return = max(min(pred_log_return, 1.0), -1.0)
+            # モデル出力（正規化対数リターン）を取得し、逆正規化してクリップ
+            pred_norm = model(seq, torch.tensor([tid], device=device)).item()
+            # de-normalize prediction back to log-return and clip to ±0.5
+            pred_log_return = pred_norm * y_all_std + y_all_mean
+            pred_log_return = max(min(pred_log_return, 0.5), -0.5)
 
             # 1ヶ月リターンに変換
             month_ratio = math.exp(pred_log_return) - 1
