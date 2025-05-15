@@ -695,13 +695,26 @@ def main():
     rows = []
     with torch.no_grad():
         for tid, tkr in enumerate(mat.columns):
-            seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-            # Model predicts 22-day log-return (approx. 1 month)
+            # 学習時と同じ正規化を推論部でも行う
+            raw_window = mat[tkr].values[-60:]
+            base = raw_window[-1]
+            if base <= 0:
+                continue
+            ratio = raw_window / base
+            if np.any(ratio <= 0):
+                continue
+            window = np.log(ratio)
+            seq = torch.tensor(window, dtype=torch.float32, device=device) \
+                       .unsqueeze(0).unsqueeze(-1)
+
+            # モデル出力（対数リターン）を取得しクリップ
             pred_log_return = model(seq, torch.tensor([tid], device=device)).item()
-            # Convert to 1-month percent return
+            pred_log_return = max(min(pred_log_return, 1.0), -1.0)
+
+            # 1ヶ月リターンに変換
             month_ratio = math.exp(pred_log_return) - 1
-            cur_price = mat[tkr].values[-1]
-            pred_price = cur_price * math.exp(pred_log_return)
+            cur_price   = base
+            pred_price  = cur_price * math.exp(pred_log_return)
             rows.append((tkr, cur_price, pred_price, month_ratio))
 
     # --- 単価フィルタを追加（例：100円未満を除外） ---
