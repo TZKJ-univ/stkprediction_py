@@ -566,6 +566,7 @@ def build_dataset(mat: pd.DataFrame, window_size: int = 60, shift: int = 22):
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--csv",default="result.csv")
     args = p.parse_args()
+    start_time = time.time()
 
     cds = codes()
     # ETF/REIT を除外（quoteType "ETF" または "REIT" のもののみ除外）
@@ -695,28 +696,29 @@ def main():
     with torch.no_grad():
         for tid, tkr in enumerate(mat.columns):
             seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-            # Model predicts log-return; convert to price and ratio
+            # Model predicts log-return directly
             pred_log_return = model(seq, torch.tensor([tid], device=device)).item()
             cur_price = mat[tkr].values[-1]
-            ratio = math.exp(pred_log_return)  # price ratio = exp(log-return)
-            pred_price = cur_price * ratio
-            rows.append((tkr, cur_price, pred_price, ratio))
+            pred_price = cur_price * math.exp(pred_log_return)
+            rows.append((tkr, cur_price, pred_price, pred_log_return))
 
     # --- 単価フィルタを追加（例：100円未満を除外） ---
     MIN_PRICE_YEN = 100
-    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "Ratio"])
+    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "LogReturn"])
     df_all = df_all[df_all["Current"] >= MIN_PRICE_YEN]
     df_out = (
         df_all
-        .sort_values("Ratio", ascending=False)
+        .sort_values("LogReturn", ascending=False)
         .head(20)
     )
     df_out.to_csv(args.csv, index=False)
     print(df_out.to_string(index=False, formatters={
         "Current": "{:.2f}".format,
         "Predicted": "{:.2f}".format,
-        "Ratio": "{:.2%}".format,
+        "LogReturn": lambda x: "{:.2%}".format(math.exp(x)-1),
     }))
+    elapsed = time.time() - start_time
+    print(f"[INFO] Elapsed time: {elapsed:.2f} seconds")
 
 if __name__=="__main__":
     main()
