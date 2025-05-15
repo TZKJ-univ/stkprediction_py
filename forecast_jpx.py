@@ -1,5 +1,6 @@
 import pandas as pd
 from scipy.optimize import minimize
+import math
 def walk_forward_splits(df: pd.DataFrame, date_col: str, n_splits: int):
     """
     Generate walk‑forward train/validation index splits based on a date column.
@@ -39,12 +40,12 @@ except ImportError:
 
 # ---- device selection ----
 if torch is None:
-    device = "cpu"
+    device = torch.device("cpu")
 else:
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        # Apple Silicon GPU (Metal Performance Shaders)
+        # Apple Silicon GPU (Metal Performance Shaders)
         device = torch.device("mps")
     else:
         device = torch.device("cpu")
@@ -536,8 +537,26 @@ def build_dataset(mat: pd.DataFrame, window_size: int = 60, shift: int = 22):
     for tid, tkr in enumerate(tickers):
         arr = mat[tkr].values
         for i in range(window_size, len(arr) - shift + 1):
-            Xs.append(arr[i - window_size:i])
-            ys.append(arr[i + shift - 1])
+            raw_window = arr[i - window_size:i]
+            raw_label = arr[i + shift - 1]
+            # Skip NaNs
+            if np.isnan(raw_window).any() or np.isnan(raw_label):
+                continue
+            base = raw_window[-1]
+            # avoid invalid base
+            if base <= 0:
+                continue
+            # ---- log-return normalization ----
+            ratio = raw_window / base
+            if np.any(ratio <= 0):
+                continue
+            window = np.log(ratio)
+            label_ratio = raw_label / base
+            if label_ratio <= 0:
+                continue
+            label = np.log(label_ratio)
+            Xs.append(window)
+            ys.append(label)
             tids.append(tid)
     Xs = torch.tensor(Xs, dtype=torch.float32).unsqueeze(-1)  # (N, win, 1)
     ys = torch.tensor(ys, dtype=torch.float32).view(-1, 1)
@@ -570,6 +589,13 @@ def main():
     # メモリ節約: 過去5年分の履歴に限定
     cutoff = mat.index.max() - pd.DateOffset(years=HISTORY_YEARS)
     mat = mat[mat.index >= cutoff]
+
+    # --- 最新日の終値が NaN のティッカーを除外し、残数を表示 ---
+    before_cnt = mat.shape[1]
+    mat = mat.loc[:, ~mat.tail(1).isna().squeeze()]
+    after_cnt = mat.shape[1]
+    print(f"[INFO] Dropped {before_cnt - after_cnt} tickers with NaN latest price; {after_cnt} remain.")
+
     gc.collect()
 
     # ---- Transformer‑based global model ----
@@ -588,9 +614,17 @@ def main():
         model.train()
         for xb, tidb, yb in full_dl:
             xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+            # ---- debug: detect NaNs in inputs ----
+            if torch.isnan(xb).any() or torch.isnan(yb).any():
+                raise RuntimeError(f"NaN detected in input features or targets at epoch {epoch+1}")
             optimizer.zero_grad()
-            loss = criterion(model(xb, tidb), yb)
+            pred = model(xb, tidb)
+            # ---- debug: detect NaNs in model output ----
+            if torch.isnan(pred).any():
+                raise RuntimeError(f"NaN detected in model output at epoch {epoch+1}")
+            loss = criterion(pred, yb)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
         # --- Epoch-end evaluation: preview top-10 ratios ---
         model.eval()
@@ -604,25 +638,56 @@ def main():
                 epoch_rows.append((tkr, ratio))  # collect all; we'll sort later
         top10 = sorted(epoch_rows, key=lambda x: x[1], reverse=True)[:10]
         if not top10:
-            print(f"[Epoch {epoch+1}/10] MSE={mse:.6f} | R2={r2:.4f} | Top‑10 → (no predictions yet)")
+            print(f"[Epoch {epoch+1}/10] MSE={float('nan'):.6f} | R2={float('nan'):.4f} | Top‑10 → (no predictions yet)")
             continue
         top10_str = "; ".join(f"{t}:{r:.2%}" for t, r in top10)
 
         # ---- MSE & R2 over all samples ----
-        mse_sum = ss_res = ss_tot = n_total = 0.0
+        criterion_eval = nn.MSELoss()
+        all_preds = []
+        all_targets = []
         with torch.no_grad():
             for xb, tidb, yb in eval_dl:
                 xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
-                pred = model(xb, tidb)
-                diff = pred - yb
-                mse_sum += diff.pow(2).sum().item()
-                ss_res  += diff.pow(2).sum().item()
-                ss_tot  += (yb - y_mean).pow(2).sum().item()
-                n_total += yb.numel()
-        mse = mse_sum / n_total if n_total else float("nan")
-        r2 = 1 - ss_res / ss_tot if ss_tot else float("nan")
+                preds = model(xb, tidb)
+                all_preds.append(preds.cpu())
+                all_targets.append(yb.cpu())
+        if all_preds and all_targets:
+            y_pred_tensor = torch.cat(all_preds, dim=0)
+            y_true_tensor = torch.cat(all_targets, dim=0)
+            mse = criterion_eval(y_pred_tensor, y_true_tensor).item()
+            # R2 score: 1 - SS_res / SS_tot
+            mean_true = y_true_tensor.mean()
+            ss_res = ((y_true_tensor - y_pred_tensor) ** 2).sum().item()
+            ss_tot = ((y_true_tensor - mean_true) ** 2).sum().item()
+            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+        else:
+            mse = float("nan")
+            r2 = float("nan")
 
         print(f"[Epoch {epoch+1}/10] MSE={mse:.6f} | R2={r2:.4f} | Top‑10 → {top10_str}")
+
+    # ---- Final evaluation on full dataset ----
+    criterion_eval = nn.MSELoss()
+    all_preds, all_targets = [], []
+    model.eval()
+    with torch.no_grad():
+        for xb, tidb, yb in eval_dl:
+            xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+            preds = model(xb, tidb)
+            all_preds.append(preds.cpu())
+            all_targets.append(yb.cpu())
+    if all_preds and all_targets:
+        y_pred_tensor = torch.cat(all_preds, dim=0)
+        y_true_tensor = torch.cat(all_targets, dim=0)
+        mse_final = criterion_eval(y_pred_tensor, y_true_tensor).item()
+        mean_true = y_true_tensor.mean()
+        ss_res = ((y_true_tensor - y_pred_tensor) ** 2).sum().item()
+        ss_tot = ((y_true_tensor - mean_true) ** 2).sum().item()
+        r2_final = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+    else:
+        mse_final, r2_final = float("nan"), float("nan")
+    print(f"[Final] MSE={mse_final:.6f} | R2={r2_final:.4f}")
 
     # ---- 推論＆結果整形 ----
     model.eval()
@@ -630,15 +695,22 @@ def main():
     with torch.no_grad():
         for tid, tkr in enumerate(mat.columns):
             seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-            pred_price = model(seq, torch.tensor([tid], device=device)).item()
-            cur_price  = mat[tkr].values[-1]
-            ratio = pred_price / cur_price
-            if ratio > 1.0:   # Present only positive‑return candidates
-                rows.append((tkr, cur_price, pred_price, ratio))
+            # Model predicts log-return; convert to price and ratio
+            pred_log_return = model(seq, torch.tensor([tid], device=device)).item()
+            cur_price = mat[tkr].values[-1]
+            ratio = math.exp(pred_log_return)  # price ratio = exp(log-return)
+            pred_price = cur_price * ratio
+            rows.append((tkr, cur_price, pred_price, ratio))
 
-    df_out = (pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "Ratio"])
-                .sort_values("Ratio", ascending=False)
-                .head(20))
+    # --- 単価フィルタを追加（例：100円未満を除外） ---
+    MIN_PRICE_YEN = 100
+    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "Ratio"])
+    df_all = df_all[df_all["Current"] >= MIN_PRICE_YEN]
+    df_out = (
+        df_all
+        .sort_values("Ratio", ascending=False)
+        .head(20)
+    )
     df_out.to_csv(args.csv, index=False)
     print(df_out.to_string(index=False, formatters={
         "Current": "{:.2f}".format,
