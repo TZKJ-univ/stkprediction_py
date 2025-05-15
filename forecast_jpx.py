@@ -696,29 +696,28 @@ def main():
     with torch.no_grad():
         for tid, tkr in enumerate(mat.columns):
             seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-            # Model predicts 22-day log-return
+            # Model predicts 22-day log-return (approx. 1 month)
             pred_log_return = model(seq, torch.tensor([tid], device=device)).item()
-            # Convert to daily return
-            daily_log_return = pred_log_return / SHIFT
-            daily_ratio = math.exp(daily_log_return) - 1
+            # Convert to 1-month percent return
+            month_ratio = math.exp(pred_log_return) - 1
             cur_price = mat[tkr].values[-1]
-            pred_price = cur_price * (1 + daily_ratio)
-            rows.append((tkr, cur_price, pred_price, daily_ratio))
+            pred_price = cur_price * math.exp(pred_log_return)
+            rows.append((tkr, cur_price, pred_price, month_ratio))
 
     # --- 単価フィルタを追加（例：100円未満を除外） ---
     MIN_PRICE_YEN = 100
-    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "DailyReturn"])
+    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "MonthlyReturn"])
     df_all = df_all[df_all["Current"] >= MIN_PRICE_YEN]
     df_out = (
         df_all
-        .sort_values("DailyReturn", ascending=False)
+        .sort_values("MonthlyReturn", ascending=False)
         .head(20)
     )
     df_out.to_csv(args.csv, index=False)
     print(df_out.to_string(index=False, formatters={
         "Current": "{:.2f}".format,
         "Predicted": "{:.2f}".format,
-        "DailyReturn": "{:.2%}".format,
+        "MonthlyReturn": "{:.2%}".format,
     }))
     elapsed = time.time() - start_time
     print(f"[INFO] Elapsed time: {elapsed:.2f} seconds")
