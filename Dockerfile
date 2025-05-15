@@ -1,29 +1,20 @@
-# CUDA 12.6.3 + Ubuntu24.04 をベースにする
-FROM nvidia/cuda:12.6.3-base-ubuntu24.04
+# ベースに NGC の公式 PyTorch コンテナを使う（CUDA 12.6 + cuDNN 最適化済み）
+FROM nvcr.io/nvidia/pytorch:24.08-py3
 
-# 環境変数
-ENV PYTHONUNBUFFERED=1
-ENV TZ=Asia/Tokyo
-ENV PATH="/opt/venv/bin:$PATH"
-
-# システム依存ライブラリと venv 用ツールのインストール
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-      python3.12 python3.12-venv build-essential git && \
-    rm -rf /var/lib/apt/lists/* && \
-    python3.12 -m venv /opt/venv
+# 必要ならタイムゾーンなど環境変数を設定
+ENV TZ=Asia/Tokyo \
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# 依存を先にコピーしてキャッシュを有効活用
+# ユーザーの Python 依存関係
 COPY requirements.txt ./
+RUN pip install --upgrade pip \
+ && pip install --no-cache-dir -r requirements.txt
 
-# 仮想環境内でインストール
-RUN pip install --no-cache-dir -r requirements.txt
-
-# ソースコードを全コピー
+# アプリケーションコードをコピー
 COPY . .
 
-# 実行コマンド
+# 実行
 ENTRYPOINT ["python", "forecast_jpx.py"]
 CMD ["--csv", "result.csv"]
