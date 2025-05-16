@@ -617,7 +617,7 @@ def main():
     eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
 
     model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
     criterion = nn.MSELoss()
 
     for epoch in range(10):
