@@ -747,48 +747,5 @@ def main():
     elapsed = time.time() - start_time
     print(f"[INFO] Elapsed time: {elapsed:.2f} seconds")
 
-    # ---- 実測値と予測値のグラフ出力（1位のティッカー） ----
-    import matplotlib.pyplot as plt
-
-    top_ticker = df_out.iloc[0]["Ticker"]
-    dates = mat.index
-
-    # 実測月次リターンの計算 (ラベルと同様の方式で np.log 差分から変換)
-    actual_log = (np.log(mat[top_ticker].shift(-SHIFT)) - np.log(mat[top_ticker]))
-    actual_log = actual_log.iloc[window_size:].dropna()  # 最初の window_size は予測対象外
-    actual = np.exp(actual_log) - 1
-
-    # 予測月次リターンのスライディングウィンドウ予測
-    preds = []
-    pred_dates = actual.index  # 実測と同じ日付で比較
-    tid = mat.columns.get_loc(top_ticker)
-    window_size = 60  # hardcode, or retrieve from earlier in main
-    for date in pred_dates:
-        raw_window = mat[top_ticker].loc[:date].values[-window_size:]
-        base = raw_window[-1]
-        if base <= 0 or np.any(raw_window <= 0):
-            preds.append(np.nan)
-            continue
-        window = np.log(raw_window / base)
-        norm_window = (window - X_mean.item()) / X_std.item()
-        seq = torch.tensor(norm_window, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-        pred_norm = model(seq, torch.tensor([tid], device=device)).item()
-        pred_log_return = pred_norm * y_all_std + y_all_mean
-        pred_log_return = max(min(pred_log_return, 0.5), -0.5)
-        preds.append(math.exp(pred_log_return) - 1)
-
-    # プロット作成
-    plt.figure(figsize=(10, 4))
-    plt.plot(pred_dates, actual.values, label="Actual")
-    plt.plot(pred_dates, preds, label="Predicted", linestyle="--")
-    plt.title(f"{top_ticker} Actual vs Predicted Monthly Return")
-    plt.xlabel("Date")
-    plt.ylabel("Monthly Return")
-    plt.legend()
-    plt.tight_layout()
-    plot_path = f"{top_ticker}_monthly_return.png"
-    plt.savefig(plot_path)
-    print(f"[INFO] Saved plot to {plot_path}")
-
 if __name__=="__main__":
     main()
