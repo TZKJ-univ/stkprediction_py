@@ -512,13 +512,14 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
 
 class StockPriceTFT(nn.Module):
     """Simplified Temporal Fusion‑style model: Embedding → LSTM → Self‑Attention → Linear."""
-    def __init__(self, num_tickers: int, input_dim: int, d_model: int = 128, nhead: int = 4):
+    def __init__(self, num_tickers: int, input_dim: int, d_model: int = 128, nhead: int = 4, dropout: float = 0.1):
         super().__init__()
         self.embed = nn.Embedding(num_tickers, d_model)
-        self.lstm  = nn.LSTM(input_dim, d_model, batch_first=True)
-        enc_layer  = TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.lstm  = nn.LSTM(input_dim, d_model, batch_first=True, dropout=dropout)
+        enc_layer  = TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
         self.transformer = TransformerEncoder(enc_layer, num_layers=1)
         self.fc = nn.Linear(d_model, 1)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x_seq: torch.Tensor, ticker_id: torch.Tensor): # type: ignore
         # x_seq shape: (batch, seq_len, input_dim)
@@ -527,7 +528,8 @@ class StockPriceTFT(nn.Module):
         c0 = torch.zeros_like(h0)                        # same shape as h0
         lstm_out, _ = self.lstm(x_seq, (h0, c0))         # (batch, seq_len, d_model)
         attn_out = self.transformer(lstm_out)            # (batch, seq_len, d_model)
-        return self.fc(attn_out[:, -1, :])               # (batch, 1)
+        out = self.fc(self.dropout(attn_out[:, -1, :]))  # (batch, 1)
+        return out
 
 
 def build_dataset(mat: pd.DataFrame, window_size: int = 60, shift: int = 22):
@@ -616,8 +618,8 @@ def main():
     full_dl = DataLoader(full_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
     eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
 
-    model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1, dropout=0.1).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
     criterion = nn.MSELoss()
 
     for epoch in range(10):
