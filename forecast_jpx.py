@@ -309,6 +309,7 @@ def update_chunk(chunk: list[str], idx: int):
     to_fetch = chunk.copy()
     acc_df = None
     f = DATA_DIR / f"{idx}.feather"
+    f_vol = DATA_DIR / f"{idx}_vol.feather"
 
     start = "2015-01-01"
     if f.exists():
@@ -362,9 +363,10 @@ def update_chunk(chunk: list[str], idx: int):
     # Use accumulated DataFrame for downstream processing
     df = acc_df
 
-    # ----- Close が無いときは Adj Close を使う -----
+    # ----- Close/Volumeが無いときは Adj Close を使う -----
     if isinstance(df.columns, pd.MultiIndex):
         lvl1 = df.columns.get_level_values(1)
+        # --- Close ---
         if "Close" in lvl1:
             closes = df.xs("Close", level=1, axis=1)
         elif "Adj Close" in lvl1:
@@ -376,6 +378,17 @@ def update_chunk(chunk: list[str], idx: int):
             .reset_index()
             .rename(columns={0: "Close"})
         )
+        # --- Volume ---
+        if "Volume" in lvl1:
+            volumes = df.xs("Volume", level=1, axis=1)
+            volumes = (
+                volumes.stack()
+                .reset_index()
+                .rename(columns={0: "Volume"})
+            )
+        else:
+            # if no Volume data, skip
+            volumes = None
     else:
         closes = df[["Close"]] if "Close" in df else pd.DataFrame()
         if closes.empty and "Adj Close" in df:
@@ -387,8 +400,22 @@ def update_chunk(chunk: list[str], idx: int):
             .rename(columns={"index": "Date"})
             .assign(Ticker=chunk[0])
         )
+        closes.columns = ["Date", "Ticker", "Close"]
+        # --- Volume ---
+        if "Volume" in df:
+            volumes = (
+                df[["Volume"]]
+                .reset_index()
+                .rename(columns={"index": "Date"})
+                .assign(Ticker=chunk[0])
+            )
+            volumes.columns = ["Date", "Ticker", "Volume"]
+        else:
+            volumes = None
 
     closes.columns = ["Date", "Ticker", "Close"]
+    if volumes is not None:
+        volumes.columns = ["Date", "Ticker", "Volume"]
 
     # ----------- 保存 -----------
     if f.exists():
@@ -397,10 +424,18 @@ def update_chunk(chunk: list[str], idx: int):
            .to_feather(f))
     else:
         closes.to_feather(f)
+    # 保存: Volume
+    if volumes is not None:
+        if f_vol.exists():
+            (pd.concat([pd.read_feather(f_vol), volumes])
+               .drop_duplicates(subset=["Date", "Ticker"])
+               .to_feather(f_vol))
+        else:
+            volumes.to_feather(f_vol)
 
 def price_matrix(cds: list[str]) -> pd.DataFrame:
     """Build Close matrix from feather/<idx>.feather files created by update_chunk."""
-    files = list(DATA_DIR.glob("*.feather"))
+    files = [f for f in DATA_DIR.glob("*.feather") if not str(f).endswith("_vol.feather")]
     if not files:
         sys.exit("no feather data")
     df = pd.concat(pd.read_feather(f) for f in files)
@@ -419,7 +454,26 @@ def price_matrix(cds: list[str]) -> pd.DataFrame:
     mat.index = pd.to_datetime(mat.index)
     return mat
 
-def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> pd.DataFrame:
+# --- 出来高マトリクス ---
+def volume_matrix(cds: list[str]) -> pd.DataFrame:
+    """Build Volume matrix from feather/<idx>_vol.feather files created by update_chunk."""
+    files = [f for f in DATA_DIR.glob("*_vol.feather")]
+    if not files:
+        raise RuntimeError("no feather volume data")
+    df = pd.concat(pd.read_feather(f) for f in files)
+    df['Date'] = pd.to_datetime(df['Date'])
+    cutoff = df['Date'].max() - pd.DateOffset(years=HISTORY_YEARS)
+    df = df[df['Date'] >= cutoff]
+    df = df.drop_duplicates(subset=["Date", "Ticker"])
+    mat = (
+        df.pivot(index="Date", columns="Ticker", values="Volume")
+          .sort_index()
+          .ffill()
+    )
+    mat.index = pd.to_datetime(mat.index)
+    return mat
+
+def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame, volume_mat: pd.DataFrame = None) -> pd.DataFrame:
     # 基本ラグ
     feats = {f"lag_{l}": mat.shift(l) for l in LAGS}
 
@@ -442,6 +496,16 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
 
     # RSI
     feats["rsi_14"] = 100 - 100 / (1 + mat.pct_change().rolling(14).mean())
+
+    # ---- 出来高特徴量 ----
+    if volume_mat is not None:
+        # volumeのラグ
+        for l in LAGS:
+            feats[f"volume_lag_{l}"] = volume_mat.shift(l)
+        # volumeの移動平均
+        feats["volume_sma_22"] = volume_mat.rolling(22).mean()
+        feats["volume_sma_50"] = volume_mat.rolling(50).mean()
+    # (volume_matがNoneでもOK。特徴量無し)
 
     X = pd.concat(feats, axis=1).stack(future_stack=True).dropna().reset_index()
     # ensure Date column is datetime64 for merge
@@ -487,6 +551,39 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
     else:
         X['OpIncomeGrowth'] = 0
 
+    # --- 指定されたファンダメンタル指標を特徴量に追加 ---
+    # 売上高
+    if 'totalRevenue' in X.columns:
+        X['TotalRevenue'] = X['totalRevenue'].fillna(0)
+    else:
+        X['TotalRevenue'] = 0
+
+    # 純利益
+    if 'netIncomeToCommon' in X.columns:
+        X['NetIncome'] = X['netIncomeToCommon'].fillna(0)
+    elif 'netIncome' in X.columns:
+        X['NetIncome'] = X['netIncome'].fillna(0)
+    else:
+        X['NetIncome'] = 0
+
+    # ROA
+    if 'returnOnAssets' in X.columns:
+        X['ROA'] = X['returnOnAssets'].fillna(0)
+    else:
+        X['ROA'] = 0
+
+    # 営業利益率
+    if 'operatingMargins' in X.columns:
+        X['OperatingMargin'] = X['operatingMargins'].fillna(0)
+    else:
+        X['OperatingMargin'] = 0
+
+    # 時価総額
+    if 'marketCap' in X.columns:
+        X['MarketCap'] = X['marketCap'].fillna(0)
+    else:
+        X['MarketCap'] = 0
+
     # --- 外生変数を特徴量に追加（高速マージ） ---
     exog_df = exog.reset_index().rename(columns={'index': 'Date'})
     X = X.merge(exog_df, on='Date', how='left')
@@ -506,6 +603,25 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame) -> p
         X[col] = X[col].astype('float32')
     # keep rows even if fundamentals have missing (filled with 0), only drop if target missing
     return X[X["target"].notna()]
+
+
+# --- utility to cache per‑ticker feature DataFrame for quick lookup ---
+_TECH_CACHE: dict[str, pd.DataFrame] = {}
+
+def _get_ticker_features(tech_df: pd.DataFrame, ticker: str, feat_cols: list[str]) -> pd.DataFrame:
+    """
+    Return per‑ticker DataFrame indexed by Date and containing feat_cols only.
+    DataFrame is cached because it is used repeatedly during inference.
+    """
+    if ticker not in _TECH_CACHE:
+        _TECH_CACHE[ticker] = (
+            tech_df[tech_df["Ticker"] == ticker]
+            .set_index("Date")
+            .sort_index()
+            .reindex(sorted(tech_df["Date"].unique()))[feat_cols]      # full date index align
+            .fillna(0.0)
+        )
+    return _TECH_CACHE[ticker]
 
 
 # --- Transformer-based global model ---
@@ -532,41 +648,71 @@ class StockPriceTFT(nn.Module):
         return out
 
 
-def build_dataset(mat: pd.DataFrame, window_size: int = 60, shift: int = 22):
-    """Return tensors (X_seq, y, ticker_ids) for all tickers."""
+def build_dataset(mat: pd.DataFrame,
+                  tech_df: pd.DataFrame,
+                  window_size: int = 60,
+                  shift: int = 22) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Build (X_seq, y, ticker_id) tensors that contain **all** explanatory variables:
+
+      • price series (log‑returned & base‑normalised)  -> 1 column
+      • every column in tech_df except ['Date','Ticker','target'] -> F columns
+
+    Output tensor shape: (N, window_size, 1+F)
+    """
     Xs, ys, tids = [], [], []
     tickers = mat.columns.tolist()
+
+    # --- feature column list (same order everywhere) ---
+    feat_cols = [c for c in tech_df.columns if c not in ("Date", "Ticker", "target")]
+    global FEAT_COLS
+    FEAT_COLS = feat_cols
+
+    # ---- iterate ticker by ticker ----
     for tid, tkr in enumerate(tickers):
-        arr = mat[tkr].values
-        for i in range(window_size, len(arr) - shift + 1):
-            raw_window = arr[i - window_size:i]
-            raw_label = arr[i + shift - 1]
-            # Skip NaNs
-            if np.isnan(raw_window).any() or np.isnan(raw_label):
+        price_arr = mat[tkr].values
+        tech_arr  = (
+            tech_df[tech_df["Ticker"] == tkr]
+            .set_index("Date")
+            .reindex(mat.index)[feat_cols]          # align on price index
+            .fillna(0.0)
+            .values
+        )
+
+        seq_len = min(len(price_arr), len(tech_arr))
+        for i in range(window_size, seq_len - shift + 1):
+            win_price = price_arr[i - window_size:i]
+            win_tech  = tech_arr[i - window_size:i, :]
+            label_p   = price_arr[i + shift - 1]
+
+            # sanity checks
+            if (
+                np.isnan(win_price).any()
+                or np.isnan(win_tech).any()
+                or np.isnan(label_p)
+            ):
                 continue
-            base = raw_window[-1]
-            # avoid invalid base
+            base = win_price[-1]
             if base <= 0:
                 continue
-            # ---- log-return normalization ----
-            ratio = raw_window / base
-            if np.any(ratio <= 0):
-                continue
-            window = np.log(ratio)
-            label_ratio = raw_label / base
-            if label_ratio <= 0:
-                continue
-            label = np.log(label_ratio)
-            # skip targets outside ±0.5 to remove extreme outliers
+
+            # price → log‑return relative window
+            price_feat = np.log(win_price / base)[:, None]   # (window,1)
+            label      = np.log(label_p / base)
             if abs(label) > 0.5:
                 continue
-            Xs.append(window)
-            ys.append(label)
+
+            feat = np.concatenate([price_feat, win_tech], axis=1)  # (window, 1+F)
+
+            Xs.append(feat.astype(np.float32))
+            ys.append(np.float32(label))
             tids.append(tid)
-    Xs = torch.tensor(Xs, dtype=torch.float32).unsqueeze(-1)  # (N, win, 1)
-    ys = torch.tensor(ys, dtype=torch.float32).view(-1, 1)
-    tids = torch.tensor(tids, dtype=torch.long)
-    return Xs, ys, tids
+
+    return (
+        torch.tensor(Xs,  dtype=torch.float32),
+        torch.tensor(ys,  dtype=torch.float32).view(-1, 1),
+        torch.tensor(tids, dtype=torch.long),
+    )
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--csv",default="result.csv")
@@ -596,17 +742,38 @@ def main():
     cutoff = mat.index.max() - pd.DateOffset(years=HISTORY_YEARS)
     mat = mat[mat.index >= cutoff]
 
+    # --- 出来高マトリクスも構築 ---
+    try:
+        volume_mat = volume_matrix(cds)
+        volume_mat = volume_mat[volume_mat.index >= cutoff]
+    except Exception:
+        print("[WARN] Volume matrix not available, skipping volume features")
+        volume_mat = None
+
+    # --- load exogenous series & build full feature DataFrame ----------
+    exog_start = mat.index.min().strftime("%Y-%m-%d")
+    exog_end   = mat.index.max().strftime("%Y-%m-%d")
+    exog_df    = load_exogenous(EXOGENOUS_TICKERS, exog_start, exog_end, INTERVAL)
+
+    tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
+
     # --- 最新日の終値が NaN のティッカーを除外し、残数を表示 ---
     before_cnt = mat.shape[1]
     mat = mat.loc[:, ~mat.tail(1).isna().squeeze()]
     after_cnt = mat.shape[1]
     print(f"[INFO] Dropped {before_cnt - after_cnt} tickers with NaN latest price; {after_cnt} remain.")
+    if volume_mat is not None:
+        # 価格・出来高とも列名が一致するティッカーだけ使用
+        common_cols = [c for c in mat.columns if c in volume_mat.columns]
+        mat = mat[common_cols]
+        volume_mat = volume_mat[common_cols]
+        print(f"[INFO] 共通ティッカー数: {len(common_cols)}")
 
     gc.collect()
 
     # ---- Transformer‑based global model ----
     # Build supervised tensors for all tickers
-    X_all, y_all, tids_all = build_dataset(mat, window_size=60, shift=SHIFT)
+    X_all, y_all, tids_all = build_dataset(mat, tech_df, window_size=60, shift=SHIFT)
     # --- 標準化: 入力特徴量(X_all)とターゲット(y_all)を平均0分散1にスケーリング ---
     X_mean = X_all.mean()
     X_std = X_all.std()
@@ -614,17 +781,45 @@ def main():
     y_all_std = y_all.std().item()
     X_all = (X_all - X_mean) / X_std
     y_all = (y_all - y_all_mean) / y_all_std
+
+    # --- 訓練/バリデーション分割（末尾20%をバリデーション） ---
+    num_samples = X_all.shape[0]
+    val_size = int(num_samples * 0.2)
+    if val_size < 1:
+        val_size = 1
+    train_size = num_samples - val_size
+    # shuffle indices for random split
+    indices = np.arange(num_samples)
+    np.random.shuffle(indices)
+    train_idx = indices[:train_size]
+    val_idx = indices[train_size:]
+    X_train, tids_train, y_train = X_all[train_idx], tids_all[train_idx], y_all[train_idx]
+    X_val, tids_val, y_val = X_all[val_idx], tids_all[val_idx], y_all[val_idx]
+    train_ds = TensorDataset(X_train, tids_train, y_train)
+    val_ds = TensorDataset(X_val, tids_val, y_val)
+    train_dl = DataLoader(train_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
+    val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
     full_ds = TensorDataset(X_all, tids_all, y_all)
-    full_dl = DataLoader(full_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
     eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
 
-    model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=1, dropout=0.1).to(device)
+    # 入力次元(出来高あり:2, なし:1)
+    input_dim = X_all.shape[2]
+    model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=input_dim, dropout=0.1).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
     criterion = nn.MSELoss()
 
-    for epoch in range(10):
+    # --- EarlyStopping params ---
+    patience = 5
+    min_delta = 1e-5
+    best_val_loss = float("inf")
+    best_epoch = -1
+    patience_counter = 0
+    best_state_dict = None
+    max_epochs = 20
+
+    for epoch in range(max_epochs):
         model.train()
-        for xb, tidb, yb in full_dl:
+        for xb, tidb, yb in train_dl:
             xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
             # ---- debug: detect NaNs in inputs ----
             if torch.isnan(xb).any() or torch.isnan(yb).any():
@@ -638,49 +833,71 @@ def main():
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-        # --- Epoch-end evaluation: preview top-10 ratios ---
+        # --- バリデーション損失（MSE）計算 ---
         model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for xb, tidb, yb in val_dl:
+                xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+                pred = model(xb, tidb)
+                loss = criterion(pred, yb)
+                val_losses.append(loss.item() * xb.size(0))
+        val_loss = np.sum(val_losses) / (len(val_ds) if len(val_ds) > 0 else 1)
+        # EarlyStopping判定
+        if val_loss + min_delta < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch
+            patience_counter = 0
+            # モデルの重み保存
+            best_state_dict = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+        else:
+            patience_counter += 1
+        # --- Epoch-end evaluation: preview top-10 tickers using final inference logic ---
         epoch_rows = []
         with torch.no_grad():
             for tid, tkr in enumerate(mat.columns):
-                seq = torch.tensor(mat[tkr].values[-60:], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(-1)
-                pred_price = model(seq, torch.tensor([tid], device=device)).item()
-                cur_price  = mat[tkr].values[-1]
-                ratio = pred_price / cur_price
-                epoch_rows.append((tkr, ratio))  # collect all; we'll sort later
-        top10 = sorted(epoch_rows, key=lambda x: x[1], reverse=True)[:10]
-        if not top10:
-            print(f"[Epoch {epoch+1}/10] MSE={float('nan'):.6f} | R2={float('nan'):.4f} | Top‑10 → (no predictions yet)")
-            continue
-        top10_str = "; ".join(f"{t}:{r:.2%}" for t, r in top10)
-
-        # ---- MSE & R2 over all samples ----
-        criterion_eval = nn.MSELoss()
-        all_preds = []
-        all_targets = []
-        with torch.no_grad():
-            for xb, tidb, yb in eval_dl:
-                xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
-                preds = model(xb, tidb)
-                all_preds.append(preds.cpu())
-                all_targets.append(yb.cpu())
-        if all_preds and all_targets:
-            y_pred_tensor = torch.cat(all_preds, dim=0)
-            y_true_tensor = torch.cat(all_targets, dim=0)
-            mse = criterion_eval(y_pred_tensor, y_true_tensor).item()
-            # R2 score: 1 - SS_res / SS_tot
-            mean_true = y_true_tensor.mean()
-            ss_res = ((y_true_tensor - y_pred_tensor) ** 2).sum().item()
-            ss_tot = ((y_true_tensor - mean_true) ** 2).sum().item()
-            r2 = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
+                raw_window = mat[tkr].values[-60:]
+                base = raw_window[-1]
+                if base <= 0:
+                    continue
+                # --- compile full feature window (price + all tech features) ---
+                tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS).values[-60:]
+                price_feat = np.log(raw_window / base)[:, None]                 # (60,1)
+                feat_arr = np.concatenate([price_feat, tech_win], axis=1)       # (60,1+F)
+                seq = torch.tensor((feat_arr - X_mean.item()) / X_std.item(),
+                                   dtype=torch.float32, device=device).unsqueeze(0)
+                pred_norm = model(seq, torch.tensor([tid], device=device)).item()
+                pred_log_return = pred_norm * y_all_std + y_all_mean
+                pred_log_return = max(min(pred_log_return, 0.5), -0.5)
+                month_ratio = math.exp(pred_log_return) - 1
+                cur_price = base
+                pred_price = cur_price * math.exp(pred_log_return)
+                epoch_rows.append((tkr, cur_price, pred_price, month_ratio))
+        # Top-10 by monthly return
+        epoch_df = pd.DataFrame(epoch_rows, columns=["Ticker", "Current", "Predicted", "MonthlyReturn"])
+        epoch_df = epoch_df[epoch_df["Current"] >= 100]  # same price filter as final
+        top10_df = epoch_df.sort_values("MonthlyReturn", ascending=False).head(10)
+        if top10_df.empty:
+            print(f"[Epoch {epoch+1}/{max_epochs}] val_MSE={val_loss:.6f} | Top‑10 → (no predictions yet)")
         else:
-            mse = float("nan")
-            r2 = float("nan")
+            top10_str = "; ".join(
+                f"{row.Ticker}:Cur={row.Current:.2f},Pred={row.Predicted:.2f},Ret={row.MonthlyReturn:.2%}"
+                for row in top10_df.itertuples()
+            )
+            print(f"[Epoch {epoch+1}/{max_epochs}] val_MSE={val_loss:.6f} | Top‑10 → {top10_str}")
+        # EarlyStoppingで停止
+        if patience_counter >= patience:
+            print(f"[INFO] EarlyStopping: Validation loss did not improve for {patience} consecutive epochs. Stopping at epoch {epoch+1}.")
+            break
 
-        print(f"[Epoch {epoch+1}/10] MSE={mse:.6f} | R2={r2:.4f} | Top‑10 → {top10_str}")
+    # --- ベストモデルで推論＆評価 ---
+    if best_state_dict is not None:
+        model.load_state_dict(best_state_dict)
+    model = model.to(device)
 
-    # ---- Final evaluation on full dataset ----
+    # ---- Final evaluation on full dataset (using best model) ----
     criterion_eval = nn.MSELoss()
+    criterion_mae = nn.L1Loss()
     all_preds, all_targets = [], []
     model.eval()
     with torch.no_grad():
@@ -693,15 +910,16 @@ def main():
         y_pred_tensor = torch.cat(all_preds, dim=0)
         y_true_tensor = torch.cat(all_targets, dim=0)
         mse_final = criterion_eval(y_pred_tensor, y_true_tensor).item()
+        mae_final = criterion_mae(y_pred_tensor, y_true_tensor).item()
         mean_true = y_true_tensor.mean()
         ss_res = ((y_true_tensor - y_pred_tensor) ** 2).sum().item()
         ss_tot = ((y_true_tensor - mean_true) ** 2).sum().item()
         r2_final = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
     else:
-        mse_final, r2_final = float("nan"), float("nan")
-    print(f"[Final] MSE={mse_final:.6f} | R2={r2_final:.4f}")
+        mse_final, mae_final, r2_final = float("nan"), float("nan"), float("nan")
+    print(f"[Final] MSE={mse_final:.6f} | R2={r2_final:.4f} | MAE={mae_final:.6f}")
 
-    # ---- 推論＆結果整形 ----
+    # ---- 推論＆結果整形 (using best model) ----
     model.eval()
     rows = []
     with torch.no_grad():
@@ -711,13 +929,12 @@ def main():
             base = raw_window[-1]
             if base <= 0:
                 continue
-            ratio = raw_window / base
-            if np.any(ratio <= 0):
-                continue
-            window = np.log(ratio)
-            # apply same normalization as training
-            seq = torch.tensor((window - X_mean.item()) / X_std.item(), dtype=torch.float32, device=device) \
-                       .unsqueeze(0).unsqueeze(-1)
+            # --- compile full feature window (price + all tech features) ---
+            tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS).values[-60:]
+            price_feat = np.log(raw_window / base)[:, None]                 # (60,1)
+            feat_arr = np.concatenate([price_feat, tech_win], axis=1)       # (60,1+F)
+            seq = torch.tensor((feat_arr - X_mean.item()) / X_std.item(),
+                               dtype=torch.float32, device=device).unsqueeze(0)
 
             # モデル出力（正規化対数リターン）を取得し、逆正規化してクリップ
             pred_norm = model(seq, torch.tensor([tid], device=device)).item()
