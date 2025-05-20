@@ -27,6 +27,8 @@ from datetime import datetime
 from multiprocessing import cpu_count
 import os
 
+from fmp_python.fmp import FMP
+
 import pandas as pd, numpy as np, yfinance as yf, json
 import json
 
@@ -151,37 +153,41 @@ def load_sector_map(tickers: list[str]) -> dict[str, str]:
     return mp
 
 SECTOR_FILE = Path("sectors.json")
-FUND_FILE   = Path("fundamentals.json")
 
 # --- 外生変数（為替・指数など） ---
 EXOGENOUS_TICKERS = ["JPY=X", "^N225", "^VIX", "^TOPX"]
 
 def load_fundamentals(tickers: list[str]) -> dict[str, dict]:
     """
-    Return {ticker: {"PER": ..., "PBR": ..., "DivYield": ...}}.
-    Cache to fundamentals.json to avoid repeated calls.
+    Fetch key fundamentals (returnOnEquity, totalRevenue, netIncomeToCommon, returnOnAssets,
+    operatingMargins, marketCap, dividendYield) for each ticker using FMP or Finnhub.
     """
-    mp = {}
-    if FUND_FILE.exists():
-        try:
-            mp = json.loads(FUND_FILE.read_text())
-        except Exception:
-            pass
-    updated = False
+    fmp_key = os.getenv("FMP_API_KEY", "")
+    # initialize FMP client if key is present
+    fmp_client = FMP(api_key=fmp_key) if fmp_key else None
+
+    fundamentals: dict[str, dict] = {}
     for t in tickers:
-        if t not in mp:
+        info: dict = {}
+        # Attempt FMP only
+        if fmp_client:
             try:
-                info = yf.Ticker(t).info
-                # capture all numeric fundamentals and quoteType
-                num_info = {k: v for k, v in info.items() if isinstance(v, (int, float))}
-                num_info["quoteType"] = info.get("quoteType", "")
-                mp[t] = num_info
+                km = fmp_client.key_metrics(t)
+                # pick latest entry
+                latest = km[0] if isinstance(km, list) and km else {}
+                info.update({
+                    "returnOnEquity": latest.get("returnOnEquity"),
+                    "totalRevenue":   latest.get("revenue"),
+                    "netIncomeToCommon": latest.get("netIncome"),
+                    "returnOnAssets": latest.get("returnOnAssets"),
+                    "operatingMargins": latest.get("operatingProfitMargin"),
+                    "marketCap":       latest.get("marketCap"),
+                    "dividendYield":   latest.get("dividendYield"),
+                })
             except Exception:
-                mp[t] = {"quoteType": ""}
-            updated = True
-    if updated:
-        FUND_FILE.write_text(json.dumps(mp, ensure_ascii=False))
-    return mp
+                pass
+        fundamentals[t] = info
+    return fundamentals
 
 
 # --- 外生変数データの取得 ---
@@ -812,9 +818,6 @@ def main():
     retry_keys = zero_ratio[(zero_ratio > 0) & (zero_ratio < 1)].index.tolist()
     if retry_keys:
         print(f"[INFO] 再取得を試みる特徴量: {retry_keys}")
-        # fundamentals.json を削除して yfinance から再取得
-        if FUND_FILE.exists():
-            FUND_FILE.unlink()
         FUNDAMENTALS = load_fundamentals(cds)
         tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
 
