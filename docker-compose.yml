@@ -14,6 +14,7 @@ services:
     # ホスト側カレントを /app にマウント
     volumes:
       - .:/app
+      - ./feather:/app/feather
 
     working_dir: /app
 
