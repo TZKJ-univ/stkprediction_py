@@ -851,17 +851,34 @@ def main():
         f"(missing fundamentals or zero‑filled numeric features): {imputed_ticker_count}"
     )
 
+    # --- Exclude tickers that had any imputation ---
+    good_tickers = imputed_flags[imputed_flags == 0].index.tolist()
+    print(f"[INFO] Excluding {len(imputed_flags) - len(good_tickers)} tickers with imputation; {len(good_tickers)} remain for prediction.")
+    mat = mat[good_tickers]
+    tech_df = tech_df[tech_df["Ticker"].isin(good_tickers)]
+
     # --- 最新日の終値が NaN のティッカーを除外し、残数を表示 ---
     before_cnt = mat.shape[1]
     mat = mat.loc[:, ~mat.tail(1).isna().squeeze()]
     after_cnt = mat.shape[1]
     print(f"[INFO] Dropped {before_cnt - after_cnt} tickers with NaN latest price; {after_cnt} remain.")
+
+    # --- Post-retry zero ratio printout ---
+    zero_ratio = (tech_df[numeric_cols] == 0).sum() / len(tech_df)
+    print("[INFO] Post-retry zero ratio:")
+    for col, ratio in zero_ratio.items():
+        if ratio > 0:
+            print(f"  {col}: {ratio:.2%}")
+
     if volume_mat is not None:
         # 価格・出来高とも列名が一致するティッカーだけ使用
         common_cols = [c for c in mat.columns if c in volume_mat.columns]
         mat = mat[common_cols]
         volume_mat = volume_mat[common_cols]
         print(f"[INFO] 共通ティッカー数: {len(common_cols)}")
+
+    # Print final tickers count for model building
+    print(f"[INFO] Final tickers count for model building: {mat.shape[1]}")
 
     gc.collect()
 
