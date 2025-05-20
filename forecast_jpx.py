@@ -521,6 +521,16 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame, volu
     global SECTOR_DICT
     X["Sector"] = X["Ticker"].map(SECTOR_DICT).fillna("Unknown")
 
+    # Sector を文字列のまま残すと object 型が混入して np.isnan 等が失敗する。
+    # 数値のカテゴリコードに変換し、元列は削除しておく。
+    X["SectorCode"] = (
+        X["Sector"]
+        .astype("category")
+        .cat.codes
+        .astype("int16")
+    )
+    X.drop(columns=["Sector"], inplace=True)
+
     # --- map static fundamentals ---
     # map all numeric fundamentals dynamically (use all available yfinance indicators)
     if funds:
