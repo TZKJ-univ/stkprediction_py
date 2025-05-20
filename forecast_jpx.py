@@ -370,11 +370,15 @@ def update_chunk(chunk: list[str], idx: int):
     # ----- Close/Volumeが無いときは Adj Close を使う -----
     if isinstance(df.columns, pd.MultiIndex):
         lvl1 = df.columns.get_level_values(1)
+        # yfinance のバージョン差異で “volume / close” が全て小文字になるケースがあるため
+        lvl1_lower = [s.lower() for s in lvl1]
         # --- Close ---
-        if "Close" in lvl1:
-            closes = df.xs("Close", level=1, axis=1)
-        elif "Adj Close" in lvl1:
-            closes = df.xs("Adj Close", level=1, axis=1)
+        if "close" in lvl1_lower:
+            closes = df.xs([c for c in df.columns.levels[1] if c.lower()=="close"][0],
+                           level=1, axis=1)
+        elif "adj close" in lvl1_lower:
+            closes = df.xs([c for c in df.columns.levels[1] if c.lower()=="adj close"][0],
+                           level=1, axis=1)
         else:
             return
         closes = (
@@ -383,8 +387,9 @@ def update_chunk(chunk: list[str], idx: int):
             .rename(columns={0: "Close"})
         )
         # --- Volume ---
-        if "Volume" in lvl1:
-            volumes = df.xs("Volume", level=1, axis=1)
+        if "volume" in lvl1_lower:
+            volumes = df.xs([c for c in df.columns.levels[1] if c.lower()=="volume"][0],
+                            level=1, axis=1)
             volumes = (
                 volumes.stack()
                 .reset_index()
@@ -394,10 +399,12 @@ def update_chunk(chunk: list[str], idx: int):
             # if no Volume data, skip
             volumes = None
     else:
-        closes = df[["Close"]] if "Close" in df else pd.DataFrame()
-        if closes.empty and "Adj Close" in df:
-            closes = df[["Adj Close"]].rename(columns={"Adj Close": "Close"})
-        if closes.empty:
+        closes_cols = [c for c in df.columns if c.lower() in ("close", "adj close")]
+        if closes_cols:
+            closes = df[[closes_cols[0]]]
+            if closes_cols[0].lower() == "adj close":
+                closes = closes.rename(columns={closes_cols[0]: "Close"})
+        else:
             return
         closes = (
             closes.reset_index()
@@ -406,9 +413,10 @@ def update_chunk(chunk: list[str], idx: int):
         )
         closes.columns = ["Date", "Ticker", "Close"]
         # --- Volume ---
-        if "Volume" in df:
+        vol_cols = [c for c in df.columns if c.lower() == "volume"]
+        if vol_cols:
             volumes = (
-                df[["Volume"]]
+                df[[vol_cols[0]]]
                 .reset_index()
                 .rename(columns={"index": "Date"})
                 .assign(Ticker=chunk[0])
