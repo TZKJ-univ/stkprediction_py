@@ -1,4 +1,5 @@
 import pandas as pd
+from pandas.api.types import is_numeric_dtype
 from scipy.optimize import minimize
 import math
 def walk_forward_splits(df: pd.DataFrame, date_col: str, n_splits: int):
@@ -26,8 +27,8 @@ from pathlib import Path
 from datetime import datetime
 from multiprocessing import cpu_count
 import os
+from tqdm import tqdm
 
-from fmp_python.fmp import FMP
 
 import pandas as pd, numpy as np, yfinance as yf, json
 import json
@@ -106,7 +107,6 @@ class TransformerForecast(nn.Module):
         x = self.encoder(x)              # (seq_len, batch, d_model)
         x = x[-1, :, :]                  # last time step (batch, d_model)
         return self.fc(x)                # (batch, 1)
-from tqdm import tqdm
 
 # Suppress pandas future warnings and general user warnings
 import warnings, logging
@@ -123,7 +123,7 @@ LAGS, SHIFT = [1,5,22,66], 22          # 1か月 = 22営業日
 TRAIN_SPLIT_YEARS = 0.5   # 最後の0.5年（6ヶ月）を検証用に使う
 
 # 記憶保持年数（コード内に固定）
-HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "5"))
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "5"))  # default, may be overridden by CLI
 
 SECTOR_FILE = Path("sectors.json")
 SECTOR_DICT: dict[str, str] = {}      # filled in main()
@@ -155,39 +155,13 @@ def load_sector_map(tickers: list[str]) -> dict[str, str]:
 SECTOR_FILE = Path("sectors.json")
 
 # --- 外生変数（為替・指数など） ---
-EXOGENOUS_TICKERS = ["JPY=X", "^N225", "^VIX", "^TOPX"]
+EXOGENOUS_TICKERS = ["JPY=X", "^N225", "^VIX"]
 
 def load_fundamentals(tickers: list[str]) -> dict[str, dict]:
     """
-    Fetch key fundamentals (returnOnEquity, totalRevenue, netIncomeToCommon, returnOnAssets,
-    operatingMargins, marketCap, dividendYield) for each ticker using FMP or Finnhub.
+    Stubbed fundamentals loader: return empty fundamentals for all tickers.
     """
-    fmp_key = os.getenv("FMP_API_KEY", "")
-    # initialize FMP client if key is present
-    fmp_client = FMP(api_key=fmp_key) if fmp_key else None
-
-    fundamentals: dict[str, dict] = {}
-    for t in tickers:
-        info: dict = {}
-        # Attempt FMP only
-        if fmp_client:
-            try:
-                km = fmp_client.key_metrics(t)
-                # pick latest entry
-                latest = km[0] if isinstance(km, list) and km else {}
-                info.update({
-                    "returnOnEquity": latest.get("returnOnEquity"),
-                    "totalRevenue":   latest.get("revenue"),
-                    "netIncomeToCommon": latest.get("netIncome"),
-                    "returnOnAssets": latest.get("returnOnAssets"),
-                    "operatingMargins": latest.get("operatingProfitMargin"),
-                    "marketCap":       latest.get("marketCap"),
-                    "dividendYield":   latest.get("dividendYield"),
-                })
-            except Exception:
-                pass
-        fundamentals[t] = info
-    return fundamentals
+    return {t: {} for t in tickers}
 
 
 # --- 外生変数データの取得 ---
@@ -203,7 +177,7 @@ def load_exogenous(tickers: list[str], start: str, end: str, interval: str) -> p
         auto_adjust=False,
         progress=False,
         group_by="ticker",
-        threads=False,
+        threads=True,
     )
     # build a DataFrame of close prices
     data = {}
@@ -257,7 +231,7 @@ def update_ticker_csv(ticker: str, max_retry: int = 5):
                     interval=INTERVAL,
                     auto_adjust=False,
                     progress=False,
-                    threads=False,
+                    threads=True,
                 )
             else:
                 # 初回は期間指定で広めに取得
@@ -267,7 +241,7 @@ def update_ticker_csv(ticker: str, max_retry: int = 5):
                     interval=INTERVAL,
                     auto_adjust=False,
                     progress=False,
-                    threads=False,
+                    threads=True,
                 )
             if not df.empty:
                 break  # success
@@ -334,7 +308,7 @@ def update_chunk(chunk: list[str], idx: int):
                 auto_adjust=False,
                 progress=False,
                 group_by="ticker",
-                threads=False,
+                threads=True,
             )
             # Treat empty DataFrame as failure
             if df_chunk.empty:
@@ -528,90 +502,16 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame, volu
     global SECTOR_DICT
     X["Sector"] = X["Ticker"].map(SECTOR_DICT).fillna("Unknown")
 
-    # Sector を文字列のまま残すと object 型が混入して np.isnan 等が失敗する。
-    # 数値のカテゴリコードに変換し、元列は削除しておく。
-    X["SectorCode"] = (
-        X["Sector"]
-        .astype("category")
-        .cat.codes
-        .astype("int16")
-    )
-    X.drop(columns=["Sector"], inplace=True)
-
-    # --- map static fundamentals ---
-    # map all numeric fundamentals dynamically (use all available yfinance indicators)
-    if funds:
-        # collect the union of all numeric fundamental keys except "quoteType"
-        all_keys = sorted({k for v in funds.values() for k in v.keys() if k != "quoteType"})
-        for key in all_keys:
-            raw = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k, np.nan))
-            # original value: fill NaN with 0 so the numerical scale is preserved
-            X[key] = raw.fillna(0)
-            # missing indicator (1 = value originally missing, 0 = present)
-            X[f"{key}_miss"] = raw.isna().astype("int8")
-
-    # 配当利回り
-    if 'dividendYield' in X.columns:
-        X['DividendYield'] = X['dividendYield'].fillna(0)
-    else:
-        X['DividendYield'] = 0
-
-    # ROE
-    if 'returnOnEquity' in X.columns:
-        X['ROE'] = X['returnOnEquity'].fillna(0)
-    else:
-        X['ROE'] = 0
-
-    # 自己資本比率 = (totalAssets - totalLiab) / totalAssets
-    if 'totalAssets' in X.columns and 'totalLiab' in X.columns:
-        X['EquityRatio'] = ((X['totalAssets'] - X['totalLiab']) / X['totalAssets']).fillna(0)
-    else:
-        X['EquityRatio'] = 0
-
-    # 営業益成長率
-    if 'earningsQuarterlyGrowth' in X.columns:
-        X['OpIncomeGrowth'] = X['earningsQuarterlyGrowth'].fillna(0)
-    else:
-        X['OpIncomeGrowth'] = 0
-
-    # --- 指定されたファンダメンタル指標を特徴量に追加 ---
-    # 売上高
-    if 'totalRevenue' in X.columns:
-        X['TotalRevenue'] = X['totalRevenue'].fillna(0)
-    else:
-        X['TotalRevenue'] = 0
-
-    # 純利益
-    if 'netIncomeToCommon' in X.columns:
-        X['NetIncome'] = X['netIncomeToCommon'].fillna(0)
-    elif 'netIncome' in X.columns:
-        X['NetIncome'] = X['netIncome'].fillna(0)
-    else:
-        X['NetIncome'] = 0
-
-    # ROA
-    if 'returnOnAssets' in X.columns:
-        X['ROA'] = X['returnOnAssets'].fillna(0)
-    else:
-        X['ROA'] = 0
-
-    # 営業利益率
-    if 'operatingMargins' in X.columns:
-        X['OperatingMargin'] = X['operatingMargins'].fillna(0)
-    else:
-        X['OperatingMargin'] = 0
-
-    # 時価総額
-    if 'marketCap' in X.columns:
-        X['MarketCap'] = X['marketCap'].fillna(0)
-    else:
-        X['MarketCap'] = 0
-
     # --- 外生変数を特徴量に追加（高速マージ） ---
     exog_df = exog.reset_index().rename(columns={'index': 'Date'})
     X = X.merge(exog_df, on='Date', how='left')
     X.fillna(method='ffill', inplace=True)
     X.fillna(0, inplace=True)
+    # Mark true imputed values (where original was NaN) for numeric features
+    numeric_cols = [c for c in X.columns if c not in ("Date", "Ticker", "target")]
+    na_mask = X[numeric_cols].isna()
+    for col in numeric_cols:
+        X[f"{col}_miss"] = na_mask[col]
 
     y = (
         (np.log(mat.shift(-SHIFT)) - np.log(mat))
@@ -693,17 +593,19 @@ def build_dataset(mat: pd.DataFrame,
     Xs, ys, tids, dates = [], [], [], []
     tickers = mat.columns.tolist()
 
-    # --- feature column list (same order everywhere) ---
-    feat_cols = [c for c in tech_df.columns if c not in ("Date", "Ticker", "target")]
+    # only numeric features (exclude date, ticker, target and any non-numeric columns)
+    feat_cols = [
+        c for c in tech_df.columns
+        if c not in ("Date", "Ticker", "target")
+           and is_numeric_dtype(tech_df[c])
+    ]
     global FEAT_COLS
     FEAT_COLS = feat_cols
 
     # ---- iterate ticker by ticker ----
     for tid, tkr in enumerate(tickers):
         price_arr = mat[tkr].values
-        tech_arr  = (
-            _get_ticker_features(tech_df, tkr, feat_cols, mat.index).values
-        )
+        tech_arr = _get_ticker_features(tech_df, tkr, feat_cols, mat.index).astype(np.float32).values
 
         seq_len = min(len(price_arr), len(tech_arr))
         for i in range(window_size, seq_len - shift + 1):
@@ -742,8 +644,13 @@ def build_dataset(mat: pd.DataFrame,
     )
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--csv",default="result.csv")
+    global HISTORY_YEARS
+    p = argparse.ArgumentParser()
+    p.add_argument("--csv", default="result.csv")
+    p.add_argument("--history-years", type=int, default=HISTORY_YEARS,
+                   help="Number of years of historical data to use")
     args = p.parse_args()
+    HISTORY_YEARS = args.history_years
     start_time = time.time()
 
     cds = codes()
@@ -765,8 +672,12 @@ def main():
     global SECTOR_DICT
     SECTOR_DICT = load_sector_map(cds)
 
-    for i in tqdm(range(0, len(cds), CHUNK), desc="download"):
-        update_chunk(cds[i:i + CHUNK], i // CHUNK)
+    total_chunks = (len(cds) + CHUNK - 1) // CHUNK
+    # Download in chunks with progress bar
+    for chunk_idx in tqdm(range(total_chunks), desc="download", unit="chunk"):
+        start = chunk_idx * CHUNK
+        end = start + CHUNK
+        update_chunk(cds[start:end], chunk_idx)
 
     mat = price_matrix(cds)
     # メモリ節約: 過去5年分の履歴に限定
@@ -788,17 +699,18 @@ def main():
 
     tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
 
-    # --- Print per-column zero ratios for numeric features in tech_df ---
+    # --- Print per-column imputation rate for numeric features in tech_df ---
     numeric_cols = [
         c for c in tech_df.columns
         if c not in ("Date", "Ticker", "target") and not c.endswith("_miss")
     ]
-    zero_ratio = (tech_df[numeric_cols] == 0).sum() / len(tech_df)
-    nonzero_zero = zero_ratio[zero_ratio > 0]
-    if not nonzero_zero.empty:
-        print("[INFO] 各特徴量のゼロ比率:")
-        for col, ratio in nonzero_zero.items():
-            print(f"  {col}: {ratio:.2%}")
+    # compute imputation rate for each numeric feature
+    impute_ratio = {col: tech_df[f"{col}_miss"].sum() / len(tech_df) for col in numeric_cols}
+    nonzero_impute = {col: r for col, r in impute_ratio.items() if r > 0}
+    if nonzero_impute:
+        print("[INFO] 各特徴量の補完率 (imputation rate > 0):")
+        for col, rate in nonzero_impute.items():
+            print(f"  {col}: {rate:.2%}")
 
     # --- Print per-column missing-value ratios in tech_df ---
     missing_ratio = tech_df.isna().sum() / len(tech_df)
@@ -808,18 +720,30 @@ def main():
         for col, ratio in nonzero_missing.items():
             print(f"  {col}: {ratio:.2%}")
 
+    # --- Compute zero ratio for numeric features ---
+    zero_ratio = (tech_df[numeric_cols] == 0).sum() / len(tech_df)
     # --- fully-zero featuresの除去 ---
     full_zero_cols = zero_ratio[zero_ratio == 1.0].index.tolist()
     if full_zero_cols:
         tech_df.drop(columns=full_zero_cols, inplace=True)
         print(f"[INFO] Dropped fully-zero features: {full_zero_cols}")
 
-    # --- 再取得: 部分的にゼロの特徴量についてキャッシュをクリアして再取得を試みる ---
-    retry_keys = zero_ratio[(zero_ratio > 0) & (zero_ratio < 1)].index.tolist()
+    # --- 再取得: 補完率 > 0 の特徴量についてキャッシュをクリアして再取得を試みる ---
+    # retry features with non-zero imputation rate (補完率 > 0)
+    retry_keys = [col for col, r in impute_ratio.items() if r > 0]
     if retry_keys:
         print(f"[INFO] 再取得を試みる特徴量: {retry_keys}")
+        _TECH_CACHE.clear()  # clear per-ticker cache before retry
         FUNDAMENTALS = load_fundamentals(cds)
         tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
+        # Print imputation rates after retry
+        retry_impute_ratio = {col: tech_df[f"{col}_miss"].sum() / len(tech_df) for col in numeric_cols}
+        print("[INFO] 再取得後の補完率:")
+        for col, rate in retry_impute_ratio.items():
+            if rate > 0:
+                print(f"  {col}: {rate:.2%}")
+
+    # Remove or comment out any subsequent recomputation of retry_keys based on zero_ratio
 
     # --- count tickers that required any imputation (missing fundamental *or* zero‑filled numeric value)
     numeric_cols = [
@@ -828,32 +752,19 @@ def main():
     ]
     miss_cols = [c for c in tech_df.columns if c.endswith("_miss")]
 
-    if miss_cols or numeric_cols:
-        # row‑wise flags
-        miss_row = (
-            tech_df[miss_cols].any(axis=1)
-            if miss_cols else
-            pd.Series(False, index=tech_df.index)
-        )
-        zero_row = (
-            (tech_df[numeric_cols] == 0).any(axis=1)
-            if numeric_cols else
-            pd.Series(False, index=tech_df.index)
-        )
-        # ticker‑level flag: True if *any* row for that ticker was imputed/zero‑filled
-        imputed_flags = (miss_row | zero_row).groupby(tech_df["Ticker"]).any().astype("int8")
+    # Only consider truly imputed (NaN→0) values for exclusion
+    if miss_cols:
+        # row-wise any imputation flag
+        miss_row = tech_df[miss_cols].any(axis=1)
+        # ticker-level: if any row for a ticker had imputation
+        imputed_flags = miss_row.groupby(tech_df["Ticker"]).any().astype("int8")
         imputed_ticker_count = int(imputed_flags.sum())
     else:
         imputed_ticker_count = 0
 
-    print(
-        "[INFO] Tickers where any value was imputed "
-        f"(missing fundamentals or zero‑filled numeric features): {imputed_ticker_count}"
-    )
-
-    # --- Exclude tickers that had any imputation ---
+    # imputation があった銘柄を除外し、残りの銘柄数を表示
     good_tickers = imputed_flags[imputed_flags == 0].index.tolist()
-    print(f"[INFO] Excluding {len(imputed_flags) - len(good_tickers)} tickers with imputation; {len(good_tickers)} remain for prediction.")
+    excluded_count = len(imputed_flags) - len(good_tickers)
     mat = mat[good_tickers]
     tech_df = tech_df[tech_df["Ticker"].isin(good_tickers)]
 
@@ -861,24 +772,14 @@ def main():
     before_cnt = mat.shape[1]
     mat = mat.loc[:, ~mat.tail(1).isna().squeeze()]
     after_cnt = mat.shape[1]
-    print(f"[INFO] Dropped {before_cnt - after_cnt} tickers with NaN latest price; {after_cnt} remain.")
-
-    # --- Post-retry zero ratio printout ---
-    zero_ratio = (tech_df[numeric_cols] == 0).sum() / len(tech_df)
-    print("[INFO] Post-retry zero ratio:")
-    for col, ratio in zero_ratio.items():
-        if ratio > 0:
-            print(f"  {col}: {ratio:.2%}")
 
     if volume_mat is not None:
         # 価格・出来高とも列名が一致するティッカーだけ使用
         common_cols = [c for c in mat.columns if c in volume_mat.columns]
         mat = mat[common_cols]
         volume_mat = volume_mat[common_cols]
-        print(f"[INFO] 共通ティッカー数: {len(common_cols)}")
 
-    # Print final tickers count for model building
-    print(f"[INFO] Final tickers count for model building: {mat.shape[1]}")
+    print(f"[INFO] 最終予測対象銘柄数: {mat.shape[1]}")
 
     gc.collect()
 
