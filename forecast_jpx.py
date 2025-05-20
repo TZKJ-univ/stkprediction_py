@@ -39,6 +39,10 @@ except ImportError:
     torch = None
 
 # ---- device selection ----
+# ------------------------------------------------------------
+# 会社名（shortName / longName）を扱うための辞書
+NAME_DICT: dict[str, str] = {}   # {ticker: company name}
+# ------------------------------------------------------------
 if torch is None:
     device = torch.device("cpu")
 else:
@@ -523,9 +527,11 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame, volu
         # collect the union of all numeric fundamental keys except "quoteType"
         all_keys = sorted({k for v in funds.values() for k in v.keys() if k != "quoteType"})
         for key in all_keys:
-            X[key] = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k, 0))
-        # Drop quoteType column if present
-        X = X.drop(columns=["quoteType"], errors="ignore")
+            raw = X["Ticker"].map(lambda t, k=key: funds.get(t, {}).get(k, np.nan))
+            # original value: fill NaN with 0 so the numerical scale is preserved
+            X[key] = raw.fillna(0)
+            # missing indicator (1 = value originally missing, 0 = present)
+            X[f"{key}_miss"] = raw.isna().astype("int8")
 
     # 配当利回り
     if 'dividendYield' in X.columns:
@@ -608,32 +614,36 @@ def features(mat: pd.DataFrame, funds: dict[str, dict], exog: pd.DataFrame, volu
 # --- utility to cache per‑ticker feature DataFrame for quick lookup ---
 _TECH_CACHE: dict[str, pd.DataFrame] = {}
 
-def _get_ticker_features(tech_df: pd.DataFrame, ticker: str, feat_cols: list[str]) -> pd.DataFrame:
+def _get_ticker_features(tech_df: pd.DataFrame, ticker: str, feat_cols: list[str], full_idx) -> pd.DataFrame:
     """
     Return per‑ticker DataFrame indexed by Date and containing feat_cols only.
     DataFrame is cached because it is used repeatedly during inference.
+    Always reindex to the provided full_idx.
     """
-    if ticker not in _TECH_CACHE:
-        _TECH_CACHE[ticker] = (
+    cache_key = (ticker, tuple(full_idx))
+    if cache_key not in _TECH_CACHE:
+        _TECH_CACHE[cache_key] = (
             tech_df[tech_df["Ticker"] == ticker]
             .set_index("Date")
             .sort_index()
-            .reindex(sorted(tech_df["Date"].unique()))[feat_cols]      # full date index align
+            .reindex(full_idx)[feat_cols]      # full date index align to caller's index
             .fillna(0.0)
         )
-    return _TECH_CACHE[ticker]
+    return _TECH_CACHE[cache_key]
 
 
 # --- Transformer-based global model ---
 
 class StockPriceTFT(nn.Module):
     """Simplified Temporal Fusion‑style model: Embedding → LSTM → Self‑Attention → Linear."""
-    def __init__(self, num_tickers: int, input_dim: int, d_model: int = 128, nhead: int = 4, dropout: float = 0.1):
+    def __init__(self, num_tickers: int, input_dim: int,
+                 d_model: int = 256, nhead: int = 8,
+                 num_layers: int = 2, dropout: float = 0.2):
         super().__init__()
         self.embed = nn.Embedding(num_tickers, d_model)
         self.lstm  = nn.LSTM(input_dim, d_model, batch_first=True, dropout=dropout)
         enc_layer  = TransformerEncoderLayer(d_model=d_model, nhead=nhead, dropout=dropout, batch_first=True)
-        self.transformer = TransformerEncoder(enc_layer, num_layers=1)
+        self.transformer = TransformerEncoder(enc_layer, num_layers=num_layers)
         self.fc = nn.Linear(d_model, 1)
         self.dropout = nn.Dropout(dropout)
 
@@ -651,16 +661,19 @@ class StockPriceTFT(nn.Module):
 def build_dataset(mat: pd.DataFrame,
                   tech_df: pd.DataFrame,
                   window_size: int = 60,
-                  shift: int = 22) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                  shift: int = 22
+                 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, np.ndarray]:
     """
-    Build (X_seq, y, ticker_id) tensors that contain **all** explanatory variables:
+    Build (X_seq, y, ticker_id, date) tensors that contain **all** explanatory variables:
 
       • price series (log‑returned & base‑normalised)  -> 1 column
       • every column in tech_df except ['Date','Ticker','target'] -> F columns
+      • label is the future price (not log-return)
+      • fourth return value: row dates as np.ndarray of datetime64[ns]
 
-    Output tensor shape: (N, window_size, 1+F)
+    Output tensor shape: (N, window_size, 1+F), (N, 1), (N,), (N,)
     """
-    Xs, ys, tids = [], [], []
+    Xs, ys, tids, dates = [], [], [], []
     tickers = mat.columns.tolist()
 
     # --- feature column list (same order everywhere) ---
@@ -672,46 +685,43 @@ def build_dataset(mat: pd.DataFrame,
     for tid, tkr in enumerate(tickers):
         price_arr = mat[tkr].values
         tech_arr  = (
-            tech_df[tech_df["Ticker"] == tkr]
-            .set_index("Date")
-            .reindex(mat.index)[feat_cols]          # align on price index
-            .fillna(0.0)
-            .values
+            _get_ticker_features(tech_df, tkr, feat_cols, mat.index).values
         )
 
         seq_len = min(len(price_arr), len(tech_arr))
         for i in range(window_size, seq_len - shift + 1):
             win_price = price_arr[i - window_size:i]
             win_tech  = tech_arr[i - window_size:i, :]
-            label_p   = price_arr[i + shift - 1]
+            label_price = price_arr[i + shift - 1]          # future price (22営業日後)
 
             # sanity checks
             if (
                 np.isnan(win_price).any()
                 or np.isnan(win_tech).any()
-                or np.isnan(label_p)
+                or np.isnan(label_price)
             ):
                 continue
             base = win_price[-1]
             if base <= 0:
                 continue
 
-            # price → log‑return relative window
-            price_feat = np.log(win_price / base)[:, None]   # (window,1)
-            label      = np.log(label_p / base)
-            if abs(label) > 0.5:
+            log_ret = np.log(label_price / base)
+            if abs(log_ret) > 1.0:
                 continue
 
+            price_feat = np.log(win_price / base)[:, None]   # (window,1)
             feat = np.concatenate([price_feat, win_tech], axis=1)  # (window, 1+F)
 
             Xs.append(feat.astype(np.float32))
-            ys.append(np.float32(label))
+            ys.append(label_price.astype(np.float32))
             tids.append(tid)
+            dates.append(mat.index[i + shift - 1])
 
     return (
         torch.tensor(Xs,  dtype=torch.float32),
         torch.tensor(ys,  dtype=torch.float32).view(-1, 1),
         torch.tensor(tids, dtype=torch.long),
+        np.array(dates, dtype="datetime64[ns]")
     )
 
 def main():
@@ -722,6 +732,10 @@ def main():
     cds = codes()
     # ETF/REIT を除外（quoteType "ETF" または "REIT" のもののみ除外）
     FUNDAMENTALS = load_fundamentals(cds)
+    # --- 銘柄コード → 会社名 のマッピングを作成 -----------------
+    for _tkr, _info in FUNDAMENTALS.items():
+        _nm = _info.get("shortName") or _info.get("longName") or ""
+        NAME_DICT[_tkr] = _nm if isinstance(_nm, str) and _nm else _tkr
     filtered_cds = []
     for t in cds:
         qt = FUNDAMENTALS.get(t, {}).get("quoteType", "") or ""
@@ -757,6 +771,36 @@ def main():
 
     tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
 
+    # --- count tickers that required any imputation (missing fundamental *or* zero‑filled numeric value)
+    numeric_cols = [
+        c for c in tech_df.columns
+        if c not in ("Date", "Ticker", "target") and not c.endswith("_miss")
+    ]
+    miss_cols = [c for c in tech_df.columns if c.endswith("_miss")]
+
+    if miss_cols or numeric_cols:
+        # row‑wise flags
+        miss_row = (
+            tech_df[miss_cols].any(axis=1)
+            if miss_cols else
+            pd.Series(False, index=tech_df.index)
+        )
+        zero_row = (
+            (tech_df[numeric_cols] == 0).any(axis=1)
+            if numeric_cols else
+            pd.Series(False, index=tech_df.index)
+        )
+        # ticker‑level flag: True if *any* row for that ticker was imputed/zero‑filled
+        imputed_flags = (miss_row | zero_row).groupby(tech_df["Ticker"]).any().astype("int8")
+        imputed_ticker_count = int(imputed_flags.sum())
+    else:
+        imputed_ticker_count = 0
+
+    print(
+        "[INFO] Tickers where any value was imputed "
+        f"(missing fundamentals or zero‑filled numeric features): {imputed_ticker_count}"
+    )
+
     # --- 最新日の終値が NaN のティッカーを除外し、残数を表示 ---
     before_cnt = mat.shape[1]
     mat = mat.loc[:, ~mat.tail(1).isna().squeeze()]
@@ -773,30 +817,31 @@ def main():
 
     # ---- Transformer‑based global model ----
     # Build supervised tensors for all tickers
-    X_all, y_all, tids_all = build_dataset(mat, tech_df, window_size=60, shift=SHIFT)
-    # --- 標準化: 入力特徴量(X_all)とターゲット(y_all)を平均0分散1にスケーリング ---
-    X_mean = X_all.mean()
-    X_std = X_all.std()
+    X_all, y_all, tids_all, dates_all = build_dataset(mat, tech_df, window_size=60, shift=SHIFT)
+    # --- グローバル平均・分散を **特徴量ごと** に計算 ---
+    # shape : (1, 1, feature_dim)
+    X_mean = X_all.mean(dim=(0, 1), keepdim=True)
+    X_std  = X_all.std(dim=(0, 1),  keepdim=True).clamp_min(1e-6)
+
     y_all_mean = y_all.mean().item()
-    y_all_std = y_all.std().item()
+    y_all_std  = y_all.std().item()
+
     X_all = (X_all - X_mean) / X_std
     y_all = (y_all - y_all_mean) / y_all_std
 
-    # --- 訓練/バリデーション分割（末尾20%をバリデーション） ---
-    num_samples = X_all.shape[0]
-    val_size = int(num_samples * 0.2)
-    if val_size < 1:
-        val_size = 1
-    train_size = num_samples - val_size
-    # shuffle indices for random split
-    indices = np.arange(num_samples)
-    np.random.shuffle(indices)
-    train_idx = indices[:train_size]
-    val_idx = indices[train_size:]
+    # --- Walk-Forward Cross-Validation split ---
+    df_idx = pd.DataFrame({"Date": dates_all})
+    # 3 folds → last fold = validation, previous folds = training
+    splits = walk_forward_splits(df_idx, "Date", n_splits=3)
+    train_idx, val_idx = splits[-1]
+    train_idx = train_idx.to_numpy()
+    val_idx   = val_idx.to_numpy()
+
     X_train, tids_train, y_train = X_all[train_idx], tids_all[train_idx], y_all[train_idx]
-    X_val, tids_val, y_val = X_all[val_idx], tids_all[val_idx], y_all[val_idx]
+    X_val,   tids_val,   y_val   = X_all[val_idx],   tids_all[val_idx],   y_all[val_idx]
+
     train_ds = TensorDataset(X_train, tids_train, y_train)
-    val_ds = TensorDataset(X_val, tids_val, y_val)
+    val_ds   = TensorDataset(X_val,   tids_val,   y_val)
     train_dl = DataLoader(train_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
     val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
     full_ds = TensorDataset(X_all, tids_all, y_all)
@@ -804,18 +849,26 @@ def main():
 
     # 入力次元(出来高あり:2, なし:1)
     input_dim = X_all.shape[2]
-    model = StockPriceTFT(num_tickers=len(mat.columns), input_dim=input_dim, dropout=0.1).to(device)
+    model = StockPriceTFT(
+        num_tickers=len(mat.columns),
+        input_dim=input_dim,
+        d_model=256,
+        nhead=8,
+        num_layers=2,
+        dropout=0.2
+    ).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
     criterion = nn.MSELoss()
 
     # --- EarlyStopping params ---
-    patience = 5
-    min_delta = 1e-5
+    patience    = 5
+    min_delta   = 1e-4
     best_val_loss = float("inf")
     best_epoch = -1
     patience_counter = 0
     best_state_dict = None
-    max_epochs = 20
+    max_epochs  = 50
 
     for epoch in range(max_epochs):
         model.train()
@@ -835,14 +888,31 @@ def main():
             optimizer.step()
         # --- バリデーション損失（MSE）計算 ---
         model.eval()
-        val_losses = []
+        val_losses, val_abs_errs, val_preds_all, val_trues_all = [], [], [], []
         with torch.no_grad():
             for xb, tidb, yb in val_dl:
                 xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
                 pred = model(xb, tidb)
                 loss = criterion(pred, yb)
                 val_losses.append(loss.item() * xb.size(0))
+
+                # ---- 逆正規化して価格で誤差計算 ----
+                pred_price = pred * y_all_std + y_all_mean
+                true_price = yb   * y_all_std + y_all_mean
+                val_abs_errs.append(torch.abs(pred_price - true_price).cpu())
+                val_preds_all.append(pred_price.cpu())
+                val_trues_all.append(true_price.cpu())
+
         val_loss = np.sum(val_losses) / (len(val_ds) if len(val_ds) > 0 else 1)
+        val_mae_price = torch.cat(val_abs_errs, dim=0).mean().item() if val_abs_errs else float("nan")
+        if val_preds_all and val_trues_all:
+            _vp = torch.cat(val_preds_all, dim=0)
+            _vt = torch.cat(val_trues_all, dim=0)
+            _ss_res = ((_vt - _vp) ** 2).sum().item()
+            _ss_tot = ((_vt - _vt.mean()) ** 2).sum().item()
+            val_r2 = 1 - _ss_res / _ss_tot if _ss_tot > 0 else float("nan")
+        else:
+            val_r2 = float("nan")
         # EarlyStopping判定
         if val_loss + min_delta < best_val_loss:
             best_val_loss = val_loss
@@ -861,30 +931,42 @@ def main():
                 if base <= 0:
                     continue
                 # --- compile full feature window (price + all tech features) ---
-                tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS).values[-60:]
+                tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS, mat.index).values[-60:]
+                if tech_win.shape[0] < 60:
+                    continue  # not enough feature history
                 price_feat = np.log(raw_window / base)[:, None]                 # (60,1)
                 feat_arr = np.concatenate([price_feat, tech_win], axis=1)       # (60,1+F)
-                seq = torch.tensor((feat_arr - X_mean.item()) / X_std.item(),
-                                   dtype=torch.float32, device=device).unsqueeze(0)
+                seq = torch.tensor(feat_arr, dtype=torch.float32, device=device)
+                seq = (seq - X_mean.to(device).squeeze()) / X_std.to(device).squeeze()
+                seq = seq.unsqueeze(0)
                 pred_norm = model(seq, torch.tensor([tid], device=device)).item()
-                pred_log_return = pred_norm * y_all_std + y_all_mean
-                pred_log_return = max(min(pred_log_return, 0.5), -0.5)
-                month_ratio = math.exp(pred_log_return) - 1
+                pred_price = pred_norm * y_all_std + y_all_mean
                 cur_price = base
-                pred_price = cur_price * math.exp(pred_log_return)
-                epoch_rows.append((tkr, cur_price, pred_price, month_ratio))
+                # Target standardisation: pred_norm is on price, not log-return
+                month_ratio = np.log(pred_price / cur_price)
+                epoch_rows.append(
+                    (tkr, NAME_DICT.get(tkr, tkr), cur_price, pred_price, month_ratio)
+                )
         # Top-10 by monthly return
-        epoch_df = pd.DataFrame(epoch_rows, columns=["Ticker", "Current", "Predicted", "MonthlyReturn"])
+        epoch_df = pd.DataFrame(
+            epoch_rows,
+            columns=["Ticker", "Name", "Current", "Predicted", "MonthlyReturn"]
+        )
         epoch_df = epoch_df[epoch_df["Current"] >= 100]  # same price filter as final
         top10_df = epoch_df.sort_values("MonthlyReturn", ascending=False).head(10)
         if top10_df.empty:
-            print(f"[Epoch {epoch+1}/{max_epochs}] val_MSE={val_loss:.6f} | Top‑10 → (no predictions yet)")
+            print(f"[Epoch {epoch+1}/{max_epochs}] val_MSE={val_loss:.6f} val_MAE={val_mae_price:.2f} val_R2={val_r2:.4f} | Top‑10 → (no predictions yet)")
         else:
             top10_str = "; ".join(
-                f"{row.Ticker}:Cur={row.Current:.2f},Pred={row.Predicted:.2f},Ret={row.MonthlyReturn:.2%}"
+                f"{row.Ticker}({row.Name}):Cur={row.Current:.2f},Pred={row.Predicted:.2f},Ret={row.MonthlyReturn:.2%}"
                 for row in top10_df.itertuples()
             )
-            print(f"[Epoch {epoch+1}/{max_epochs}] val_MSE={val_loss:.6f} | Top‑10 → {top10_str}")
+            print(
+                f"[Epoch {epoch+1}/{max_epochs}] "
+                f"val_MSE={val_loss:.6f} val_MAE={val_mae_price:.2f} val_R2={val_r2:.4f} | "
+                f"Top‑10 → {top10_str}"
+            )
+        scheduler.step()
         # EarlyStoppingで停止
         if patience_counter >= patience:
             print(f"[INFO] EarlyStopping: Validation loss did not improve for {patience} consecutive epochs. Stopping at epoch {epoch+1}.")
@@ -917,7 +999,7 @@ def main():
         r2_final = 1 - ss_res / ss_tot if ss_tot > 0 else float("nan")
     else:
         mse_final, mae_final, r2_final = float("nan"), float("nan"), float("nan")
-    print(f"[Final] MSE={mse_final:.6f} | R2={r2_final:.4f} | MAE={mae_final:.6f}")
+    print(f"[Final] MSE={mse_final:.6f} | R2={r2_final:.4f} | MAE={mae_final:.2f}")
 
     # ---- 推論＆結果整形 (using best model) ----
     model.eval()
@@ -930,27 +1012,28 @@ def main():
             if base <= 0:
                 continue
             # --- compile full feature window (price + all tech features) ---
-            tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS).values[-60:]
+            tech_win = _get_ticker_features(tech_df, tkr, FEAT_COLS, mat.index).values[-60:]
+            if tech_win.shape[0] < 60:
+                continue  # not enough feature history
             price_feat = np.log(raw_window / base)[:, None]                 # (60,1)
             feat_arr = np.concatenate([price_feat, tech_win], axis=1)       # (60,1+F)
-            seq = torch.tensor((feat_arr - X_mean.item()) / X_std.item(),
-                               dtype=torch.float32, device=device).unsqueeze(0)
+            seq = torch.tensor(feat_arr, dtype=torch.float32, device=device)
+            seq = (seq - X_mean.to(device).squeeze()) / X_std.to(device).squeeze()
+            seq = seq.unsqueeze(0)
 
-            # モデル出力（正規化対数リターン）を取得し、逆正規化してクリップ
+            # モデル出力（正規化価格）を取得し、逆正規化
             pred_norm = model(seq, torch.tensor([tid], device=device)).item()
-            # de-normalize prediction back to log-return and clip to ±0.5
-            pred_log_return = pred_norm * y_all_std + y_all_mean
-            pred_log_return = max(min(pred_log_return, 0.5), -0.5)
-
-            # 1ヶ月リターンに変換
-            month_ratio = math.exp(pred_log_return) - 1
-            cur_price   = base
-            pred_price  = cur_price * math.exp(pred_log_return)
-            rows.append((tkr, cur_price, pred_price, month_ratio))
+            pred_price = pred_norm * y_all_std + y_all_mean
+            cur_price = base
+            month_ratio = np.log(pred_price / cur_price)
+            rows.append((tkr, NAME_DICT.get(tkr, tkr), cur_price, pred_price, month_ratio))
 
     # --- 単価フィルタを追加（例：100円未満を除外） ---
     MIN_PRICE_YEN = 100
-    df_all = pd.DataFrame(rows, columns=["Ticker", "Current", "Predicted", "MonthlyReturn"])
+    df_all = pd.DataFrame(
+        rows,
+        columns=["Ticker", "Name", "Current", "Predicted", "MonthlyReturn"]
+    )
     df_all = df_all[df_all["Current"] >= MIN_PRICE_YEN]
     df_out = (
         df_all
