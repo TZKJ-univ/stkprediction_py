@@ -309,6 +309,10 @@ def update_ticker_csv(ticker: str, max_retry: int = 5):
         price.to_csv(fcsv, index=False)
 
 def update_chunk(chunk: list[str], idx: int):
+    # In Docker, always perform full download and skip incremental checks
+    force_full = os.path.exists("/.dockerenv")
+    if force_full:
+        print(f"[INFO] Docker environment detected — performing full download for chunk {idx}")
     # Prepare list of tickers to fetch and accumulator
     to_fetch = chunk.copy()
     acc_df = None
@@ -316,7 +320,7 @@ def update_chunk(chunk: list[str], idx: int):
     f_vol = DATA_DIR / f"{idx}_vol.feather"
 
     start = "2015-01-01"
-    if f.exists():
+    if not force_full and f.exists():
         last = pd.read_feather(f, columns=["Date"]).Date.max()
         start = (pd.to_datetime(last) + pd.Timedelta(days=1)).date()
         today = datetime.now().date()
