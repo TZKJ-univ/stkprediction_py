@@ -781,6 +781,19 @@ def main():
     exog_df    = load_exogenous(EXOGENOUS_TICKERS, exog_start, exog_end, INTERVAL)
 
     tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
+
+    # --- Print per-column zero ratios for numeric features in tech_df ---
+    numeric_cols = [
+        c for c in tech_df.columns
+        if c not in ("Date", "Ticker", "target") and not c.endswith("_miss")
+    ]
+    zero_ratio = (tech_df[numeric_cols] == 0).sum() / len(tech_df)
+    nonzero_zero = zero_ratio[zero_ratio > 0]
+    if not nonzero_zero.empty:
+        print("[INFO] 各特徴量のゼロ比率:")
+        for col, ratio in nonzero_zero.items():
+            print(f"  {col}: {ratio:.2%}")
+
     # --- Print per-column missing-value ratios in tech_df ---
     missing_ratio = tech_df.isna().sum() / len(tech_df)
     nonzero_missing = missing_ratio[missing_ratio > 0]
@@ -788,6 +801,22 @@ def main():
         print("[INFO] Per-column missing-value ratios in tech_df (nonzero only):")
         for col, ratio in nonzero_missing.items():
             print(f"  {col}: {ratio:.2%}")
+
+    # --- fully-zero featuresの除去 ---
+    full_zero_cols = zero_ratio[zero_ratio == 1.0].index.tolist()
+    if full_zero_cols:
+        tech_df.drop(columns=full_zero_cols, inplace=True)
+        print(f"[INFO] Dropped fully-zero features: {full_zero_cols}")
+
+    # --- 再取得: 部分的にゼロの特徴量についてキャッシュをクリアして再取得を試みる ---
+    retry_keys = zero_ratio[(zero_ratio > 0) & (zero_ratio < 1)].index.tolist()
+    if retry_keys:
+        print(f"[INFO] 再取得を試みる特徴量: {retry_keys}")
+        # fundamentals.json を削除して yfinance から再取得
+        if FUND_FILE.exists():
+            FUND_FILE.unlink()
+        FUNDAMENTALS = load_fundamentals(cds)
+        tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
 
     # --- count tickers that required any imputation (missing fundamental *or* zero‑filled numeric value)
     numeric_cols = [
