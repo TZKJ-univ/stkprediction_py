@@ -309,10 +309,6 @@ def update_ticker_csv(ticker: str, max_retry: int = 5):
         price.to_csv(fcsv, index=False)
 
 def update_chunk(chunk: list[str], idx: int):
-    # In Docker, always perform full download and skip incremental checks
-    force_full = os.path.exists("/.dockerenv")
-    if force_full:
-        print(f"[INFO] Docker environment detected — performing full download for chunk {idx}")
     # Prepare list of tickers to fetch and accumulator
     to_fetch = chunk.copy()
     acc_df = None
@@ -320,13 +316,6 @@ def update_chunk(chunk: list[str], idx: int):
     f_vol = DATA_DIR / f"{idx}_vol.feather"
 
     start = "2015-01-01"
-    if not force_full and f.exists():
-        last = pd.read_feather(f, columns=["Date"]).Date.max()
-        start = (pd.to_datetime(last) + pd.Timedelta(days=1)).date()
-        today = datetime.now().date()
-        if start > today:
-            # up to date; nothing new to fetch
-            return
 
     max_retry = 5
     for r in range(max_retry):
@@ -792,6 +781,13 @@ def main():
     exog_df    = load_exogenous(EXOGENOUS_TICKERS, exog_start, exog_end, INTERVAL)
 
     tech_df = features(mat, FUNDAMENTALS, exog_df, volume_mat)
+    # --- Print per-column missing-value ratios in tech_df ---
+    missing_ratio = tech_df.isna().sum() / len(tech_df)
+    nonzero_missing = missing_ratio[missing_ratio > 0]
+    if not nonzero_missing.empty:
+        print("[INFO] Per-column missing-value ratios in tech_df (nonzero only):")
+        for col, ratio in nonzero_missing.items():
+            print(f"  {col}: {ratio:.2%}")
 
     # --- count tickers that required any imputation (missing fundamental *or* zero‑filled numeric value)
     numeric_cols = [
