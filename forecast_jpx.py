@@ -2,6 +2,47 @@ import pandas as pd
 from pandas.api.types import is_numeric_dtype
 from scipy.optimize import minimize
 import math
+import torch
+
+# Streaming dataset to avoid loading entire dataset in memory
+class WindowDataset(torch.utils.data.Dataset):
+    def __init__(self, mat, tech_df, feat_cols, window_size, shift):
+        self.mat = mat
+        self.tech_df = tech_df
+        self.feat_cols = feat_cols
+        self.window_size = window_size
+        self.shift = shift
+        self.index_map = []
+        for tid, tkr in enumerate(mat.columns):
+            price = mat[tkr].values
+            tech = _get_ticker_features(tech_df, tkr, feat_cols, mat.index).values
+            seq_len = min(len(price), len(tech))
+            for i in range(window_size, seq_len - shift + 1):
+                window_price = price[i-window_size:i]
+                if np.isnan(window_price).any() or window_price[-1] <= 0:
+                    continue
+                window_tech = tech[i-window_size:i]
+                if np.isnan(window_tech).any():
+                    continue
+                label_price = price[i + shift - 1]
+                if np.isnan(label_price) or label_price <= 0:
+                    continue
+                log_ret = np.log(label_price / window_price[-1])
+                if abs(log_ret) > 1.0:
+                    continue
+                self.index_map.append((tid, tkr, i))
+    def __len__(self):
+        return len(self.index_map)
+    def __getitem__(self, idx):
+        tid, tkr, i = self.index_map[idx]
+        price = self.mat[tkr].values
+        tech = _get_ticker_features(self.tech_df, tkr, self.feat_cols, self.mat.index).values
+        base = price[i-1]
+        price_feat = np.log(price[i-self.window_size:i] / base)[:, None]
+        win_tech = tech[i-self.window_size:i]
+        feat = np.concatenate([price_feat, win_tech], axis=1).astype(np.float32)
+        label = price[i + self.shift - 1].astype(np.float32)
+        return feat, tid, label
 def walk_forward_splits(df: pd.DataFrame, date_col: str, n_splits: int):
     """
     Generate walk‑forward train/validation index splits based on a date column.
@@ -784,39 +825,45 @@ def main():
     gc.collect()
 
     # ---- Transformer‑based global model ----
-    # Build supervised tensors for all tickers
-    X_all, y_all, tids_all, dates_all = build_dataset(mat, tech_df, window_size=60, shift=SHIFT)
-    # --- グローバル平均・分散を **特徴量ごと** に計算 ---
-    # shape : (1, 1, feature_dim)
-    X_mean = X_all.mean(dim=(0, 1), keepdim=True)
-    X_std  = X_all.std(dim=(0, 1),  keepdim=True).clamp_min(1e-6)
+    # Create streaming dataset
+    dataset = WindowDataset(mat, tech_df, FEAT_COLS, window_size=60, shift=SHIFT)
 
-    y_all_mean = y_all.mean().item()
-    y_all_std  = y_all.std().item()
+    # Compute global feature mean/std by streaming
+    stats_loader = DataLoader(dataset, batch_size=1024, shuffle=False, num_workers=0)
+    sum_feat = torch.zeros(dataset[0][0].shape[1], device=device)
+    sum_sq   = torch.zeros_like(sum_feat)
+    count    = 0
+    for feats, _, _ in stats_loader:
+        bs, win, dim = feats.shape
+        sum_feat += feats.sum(dim=(0,1)).to(device)
+        sum_sq   += (feats**2).sum(dim=(0,1)).to(device)
+        count    += bs * win
+    X_mean = (sum_feat / count).view(1,1,-1)
+    var = (sum_sq / count) - (X_mean**2).squeeze()
+    X_std = torch.sqrt(var.clamp_min(1e-6)).view(1,1,-1)
 
-    X_all = (X_all - X_mean) / X_std
-    y_all = (y_all - y_all_mean) / y_all_std
+    # Compute global label mean/std by streaming
+    sum_lbl = 0.0; sum_lbl_sq = 0.0; lbl_count = 0
+    for _, _, labels in stats_loader:
+        sum_lbl += labels.sum().item()
+        sum_lbl_sq += (labels**2).sum().item()
+        lbl_count += labels.numel()
+    y_all_mean = sum_lbl / lbl_count
+    y_all_std = math.sqrt(sum_lbl_sq / lbl_count - y_all_mean**2)
 
-    # --- Walk-Forward Cross-Validation split ---
-    df_idx = pd.DataFrame({"Date": dates_all})
-    # 3 folds → last fold = validation, previous folds = training
-    splits = walk_forward_splits(df_idx, "Date", n_splits=3)
+    # Walk-Forward CV on dataset indices
+    idx_df = pd.DataFrame({"idx": np.arange(len(dataset)), "Date": [None]*len(dataset)})
+    # n_splits folds, last fold is validation
+    splits = walk_forward_splits(idx_df, "idx", n_splits=3)
     train_idx, val_idx = splits[-1]
-    train_idx = train_idx.to_numpy()
-    val_idx   = val_idx.to_numpy()
-
-    X_train, tids_train, y_train = X_all[train_idx], tids_all[train_idx], y_all[train_idx]
-    X_val,   tids_val,   y_val   = X_all[val_idx],   tids_all[val_idx],   y_all[val_idx]
-
-    train_ds = TensorDataset(X_train, tids_train, y_train)
-    val_ds   = TensorDataset(X_val,   tids_val,   y_val)
-    train_dl = DataLoader(train_ds, batch_size=512, shuffle=True, num_workers=0, pin_memory=True)
-    val_dl = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
-    full_ds = TensorDataset(X_all, tids_all, y_all)
-    eval_dl = DataLoader(full_ds, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
+    train_ds = torch.utils.data.Subset(dataset, train_idx)
+    val_ds   = torch.utils.data.Subset(dataset, val_idx)
+    train_dl = DataLoader(train_ds, batch_size=128, shuffle=True, num_workers=0, pin_memory=True)
+    val_dl   = DataLoader(val_ds,   batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
+    eval_dl  = DataLoader(dataset,  batch_size=256, shuffle=False, num_workers=0, pin_memory=True)
 
     # 入力次元(出来高あり:2, なし:1)
-    input_dim = X_all.shape[2]
+    input_dim = dataset[0][0].shape[1]
     model = StockPriceTFT(
         num_tickers=len(mat.columns),
         input_dim=input_dim,
@@ -842,6 +889,9 @@ def main():
         model.train()
         for xb, tidb, yb in train_dl:
             xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+            # standardize inputs
+            xb = (xb - X_mean.to(device)) / X_std.to(device)
+            yb = (yb - y_all_mean) / y_all_std
             # ---- debug: detect NaNs in inputs ----
             if torch.isnan(xb).any() or torch.isnan(yb).any():
                 raise RuntimeError(f"NaN detected in input features or targets at epoch {epoch+1}")
@@ -860,10 +910,11 @@ def main():
         with torch.no_grad():
             for xb, tidb, yb in val_dl:
                 xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
+                xb = (xb - X_mean.to(device)) / X_std.to(device)
+                yb = (yb - y_all_mean) / y_all_std
                 pred = model(xb, tidb)
                 loss = criterion(pred, yb)
                 val_losses.append(loss.item() * xb.size(0))
-
                 # ---- 逆正規化して価格で誤差計算 ----
                 pred_price = pred * y_all_std + y_all_mean
                 true_price = yb   * y_all_std + y_all_mean
@@ -953,9 +1004,11 @@ def main():
     with torch.no_grad():
         for xb, tidb, yb in eval_dl:
             xb, tidb, yb = xb.to(device), tidb.to(device), yb.to(device)
-            preds = model(xb, tidb)
+            xb_std = (xb - X_mean.to(device)) / X_std.to(device)
+            yb_std = (yb - y_all_mean) / y_all_std
+            preds = model(xb_std, tidb)
             all_preds.append(preds.cpu())
-            all_targets.append(yb.cpu())
+            all_targets.append(yb_std.cpu())
     if all_preds and all_targets:
         y_pred_tensor = torch.cat(all_preds, dim=0)
         y_true_tensor = torch.cat(all_targets, dim=0)
